@@ -38,13 +38,14 @@
             
   <h1 id="search-documentation">Search</h1>
   
-  <div id="fallback" class="admonition warning">
-  <script>$('#fallback').hide();</script>
+  <noscript>
+  <div class="admonition warning">
   <p>
     Please activate JavaScript to enable the search
     functionality.
   </p>
   </div>
+  </noscript>
   
   
   <p>
@@ -54,7 +55,7 @@
   
   
   <form action="" method="get">
-    <input type="text" name="q" aria-labelledby="search-documentation" value="" />
+    <input type="text" name="q" aria-labelledby="search-documentation" value="" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"/>
     <input type="submit" value="search" />
     <span id="search-progress" style="padding-left: 10px"></span>
   </form>
@@ -88,7 +89,6 @@
 <li class="toctree-l1"><a class="reference internal" href="migrators.html#building-a-migration-yaml-using-cfep9">Building a Migration YAML Using CFEP9</a></li>
 <li class="toctree-l1"><a class="reference internal" href="migrators.html#custom-migrations">Custom Migrations</a></li>
 <li class="toctree-l1"><a class="reference internal" href="usage.html">Usage Docs</a></li>
-<li class="toctree-l1"><a class="reference internal" href="github_actions_infrastructure.html">GitHub Actions Infrastructure</a></li>
 <li class="toctree-l1"><a class="reference internal" href="version_migrator.html">Notes on the <code class="docutils literal notranslate"><span class="pre">Version</span></code> Migrator</a></li>
 </ul>
 
@@ -115,7 +115,7 @@
       &copy;2019, Conda-forge-tick Development Team.
       
       |
-      Powered by <a href="http://sphinx-doc.org/">Sphinx 4.0.1</a>
+      Powered by <a href="http://sphinx-doc.org/">Sphinx 4.3.2</a>
       &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
       
     </div>
