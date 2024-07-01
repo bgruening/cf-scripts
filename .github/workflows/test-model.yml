@@ -1,0 +1,57 @@
+name: test-model
+
+on:
+  push:
+    branches:
+      - master
+  pull_request: null
+  workflow_dispatch:
+  schedule:
+    - cron: "10 8 * * *" # every hour
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PY_COLORS: "1"
+
+jobs:
+  test-model:
+    name: test-model
+    runs-on: "ubuntu-latest"
+    defaults:
+      run:
+        shell: bash -leo pipefail {0}
+
+    steps:
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4
+
+      - uses: mamba-org/setup-micromamba@f8b8a1e23a26f60a44c853292711bacfd3eac822 # v1
+        with:
+          environment-file: conda-lock.yml
+          environment-name: cf-scripts
+          condarc-file: autotick-bot/condarc
+
+      - name: configure conda, install code, and clone cf-graph
+        run: |
+          pip install --no-deps --no-build-isolation -e .
+          git clone --depth=1 https://github.com/regro/cf-graph-countyfair.git cf-graph
+
+      - name: conda info and env
+        run: |
+          echo "=================================================================="
+          echo "=================================================================="
+          conda info
+
+          echo ""
+          echo "=================================================================="
+          echo "=================================================================="
+          conda list
+
+      - name: run pytest (model)
+        run: |
+          cd cf-graph
+          pytest \
+            --durations 10 \
+            ../tests/model

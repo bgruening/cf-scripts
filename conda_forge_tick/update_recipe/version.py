@@ -1,19 +1,18 @@
-import re
-import io
-import jinja2
 import collections.abc
 import hashlib
-import pprint
-import traceback
-from typing import (
-    MutableMapping,
-    Any,
-)
+import io
 import logging
+import pprint
+import re
+import traceback
+from typing import Any, MutableMapping
 
+import jinja2
+import jinja2.sandbox
+
+from conda_forge_tick.hashing import hash_url
 from conda_forge_tick.recipe_parser import CONDA_SELECTOR, CondaMetaYAML
 from conda_forge_tick.url_transforms import gen_transformed_urls
-from conda_forge_tick.hashing import hash_url
 from conda_forge_tick.utils import sanitize_string
 
 CHECKSUM_NAMES = [
@@ -27,7 +26,7 @@ CHECKSUM_NAMES = [
 # matches valid jinja2 vars
 JINJA2_VAR_RE = re.compile("{{ ((?:[a-zA-Z]|(?:_[a-zA-Z0-9]))[a-zA-Z0-9_]*) }}")
 
-logger = logging.getLogger("conda_forge_tick.update_recipe.version")
+logger = logging.getLogger(__name__)
 
 
 def _gen_key_selector(dct: MutableMapping, key: str):
@@ -118,7 +117,11 @@ def _try_url_and_hash_it(url: str, hash_type: str):
 
 
 def _render_jinja2(tmpl, context):
-    return jinja2.Template(tmpl, undefined=jinja2.StrictUndefined).render(**context)
+    return (
+        jinja2.sandbox.SandboxedEnvironment(undefined=jinja2.StrictUndefined)
+        .from_string(tmpl)
+        .render(**context)
+    )
 
 
 def _get_new_url_tmpl_and_hash(url_tmpl: str, context: MutableMapping, hash_type: str):
@@ -269,7 +272,7 @@ def _try_to_update_version(cmeta: Any, src: str, hash_type: str):
                     context[key.split(CONDA_SELECTOR)[0]] = val
             else:
                 context[key] = val
-        # this pulls out any jinja2 expressions that are not constans
+        # this pulls out any jinja2 expressions that are not constants
         # e.g. bits of jinja2 that extract version parts
         evaled_context = cmeta.eval_jinja2_exprs(context)
         logger.info("jinja2 context: %s", pprint.pformat(context))
@@ -300,8 +303,9 @@ def _try_to_update_version(cmeta: Any, src: str, hash_type: str):
                 else:
                     logger.critical("jinja2 variable %s is missing!", var)
                     errors.add(
-                        "missing jinja2 variable '%s' for selector '%s'"
-                        % (var, selector),
+                        "missing jinja2 variable '{}' for selector '{}'".format(
+                            var, selector
+                        ),
                     )
                     updated_version = False
                     break

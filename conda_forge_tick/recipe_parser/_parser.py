@@ -1,11 +1,12 @@
-import re
-import io
 import collections.abc
+import io
 import json
-from typing import Union, List, Any
+import re
+from typing import Any, List, Union
 
 import jinja2
 import jinja2.meta
+import jinja2.sandbox
 from ruamel.yaml import YAML
 
 CONDA_SELECTOR = "__###conda-selector###__"
@@ -84,7 +85,7 @@ def _parse_jinja2_variables(meta_yaml: str) -> dict:
         name of the variable will be `<name>__###conda-selector###__<selector>`.
     """
     meta_yaml_lines = meta_yaml.splitlines()
-    env = jinja2.Environment()
+    env = jinja2.sandbox.SandboxedEnvironment()
     parsed_content = env.parse(meta_yaml)
     all_nodes = list(parsed_content.iter_child_nodes())
 
@@ -312,7 +313,7 @@ def _remunge_jinja2_vars(meta: Union[dict, list], sentinel: str) -> Union[dict, 
 
 
 def _is_simple_jinja2_set(line):
-    env = jinja2.Environment()
+    env = jinja2.sandbox.SandboxedEnvironment()
     parsed_content = env.parse(line)
     n = list(parsed_content.iter_child_nodes())[0]
     if isinstance(n, jinja2.nodes.Assign) and isinstance(n.node, jinja2.nodes.Const):
@@ -349,7 +350,7 @@ def _replace_jinja2_vars(lines: List[str], jinja2_vars: dict) -> List[str]:
         if _re_sel:
             # if the line has a selector in it, then we need to pull
             # out the right key with the selector from jinja2_vars
-            spc, var, val, sel = _re_sel.group(1, 2, 3, 4)
+            spc, var, _, sel = _re_sel.group(1, 2, 3, 4)
             key = var.strip() + CONDA_SELECTOR + sel
             if key in jinja2_vars:
                 _new_line = (
@@ -367,7 +368,7 @@ def _replace_jinja2_vars(lines: List[str], jinja2_vars: dict) -> List[str]:
                 _new_line = line
         elif _re:
             # no selector
-            spc, var, val, end = _re.group(1, 2, 3, 4)
+            spc, var, _, end = _re.group(1, 2, 3, 4)
             if var.strip() in jinja2_vars:
                 _new_line = (
                     spc
@@ -538,7 +539,7 @@ class CondaMetaYAML:
                 return {}
 
             # look for undefined things
-            env = jinja2.Environment()
+            env = jinja2.sandbox.SandboxedEnvironment()
             ast = env.parse(tmpl)
             undefined = jinja2.meta.find_undeclared_variables(ast)
             undefined = {u for u in undefined if u not in jinja2_vars}

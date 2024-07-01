@@ -1,38 +1,33 @@
 import abc
 import collections.abc
-import subprocess
-import re
 import copy
-import logging
-import urllib.parse
-import typing
 import functools
-from typing import (
-    Optional,
-    Set,
-    Iterator,
-    List,
-)
-import yaml
+import logging
+import re
+import subprocess
+import typing
+import urllib.parse
+from typing import Iterator, List, Optional, Set
+
 import feedparser
 import requests
+import yaml
 from conda.models.version import VersionOrder
-from conda_forge_tick.utils import parse_meta_yaml
-from .hashing import hash_url
 
 # TODO: parse_version has bad type annotations
 from pkg_resources import parse_version
 
+from conda_forge_tick.utils import parse_meta_yaml
+
+from .hashing import hash_url
+
 if typing.TYPE_CHECKING:
-    from conda_forge_tick.migrators_types import (
-        MetaYamlTypedDict,
-        SourceTypedDict,
-    )
+    from conda_forge_tick.migrators_types import MetaYamlTypedDict, SourceTypedDict
 
 
 CRAN_INDEX: Optional[dict] = None
 
-logger = logging.getLogger("conda_forge_tick._update_version.update_sources")
+logger = logging.getLogger(__name__)
 
 CURL_ONLY_URL_SLUGS = [
     "https://eups.lsst.codes/",
@@ -70,15 +65,12 @@ def next_version(ver: str, increment_alpha: bool = False) -> Iterator[str]:
     ver_dot_split = ver.split(".")
     n_dot = len(ver_dot_split)
     for idot, sdot in enumerate(ver_dot_split):
-
         ver_under_split = sdot.split("_")
         n_under = len(ver_under_split)
         for iunder, sunder in enumerate(ver_under_split):
-
             ver_dash_split = sunder.split("-")
             n_dash = len(ver_dash_split)
             for idash, sdash in enumerate(ver_dash_split):
-
                 for el in _split_alpha_num(sdash):
                     ver_split.append(el)
 
@@ -144,7 +136,7 @@ class AbstractSource(abc.ABC):
         pass
 
 
-class VersionFromFeed(AbstractSource):
+class VersionFromFeed(AbstractSource, abc.ABC):
     name = "VersionFromFeed"
     ver_prefix_remove = ["release-", "releases%2F", "v_", "v.", "v"]
     dev_vers = [
@@ -159,6 +151,7 @@ class VersionFromFeed(AbstractSource):
         "test",
         "pre",
         "git",
+        "pc",
     ]
 
     def get_version(self, url) -> Optional[str]:
@@ -390,7 +383,8 @@ def url_exists(url: str, timeout=2) -> bool:
                 stderr=subprocess.STDOUT,
                 timeout=timeout,
             )
-        except Exception:
+        except Exception as e:
+            logger.debug("url_exists wget exception", exc_info=e)
             return False
         # For FTP servers an exception is not thrown
         if "No such file" in output.decode("utf-8"):
@@ -406,7 +400,8 @@ def url_exists(url: str, timeout=2) -> bool:
                 capture_output=True,
                 check=True,
             )
-        except subprocess.CalledProcessError:
+        except subprocess.CalledProcessError as e:
+            logger.debug("url_exists curl exception", exc_info=e)
             return False
 
         return True
@@ -558,11 +553,34 @@ class IncrementAlphaRawURL(BaseRawURL):
 
 class Github(VersionFromFeed):
     name = "Github"
+    version_prefix = None
+
+    def set_version_prefix(self, version: str, split_url: list[str]):
+        self.version_prefix = self.get_version_prefix(version, split_url)
+        if self.version_prefix is None:
+            return
+        logger.debug(f"Found version prefix from url: {self.version_prefix}")
+        self.ver_prefix_remove = [self.version_prefix] + self.ver_prefix_remove
+
+    def get_version_prefix(self, version: str, split_url: list[str]):
+        """Returns prefix for the first split that contains version. If prefix
+        is empty - returns None."""
+        r = re.compile(rf"^(.*){version}")
+        for split in split_url:
+            match = r.match(split)
+            if match is not None:
+                if match.group(1) == "":
+                    return None
+                return match.group(1)
+
+        return None
 
     def get_url(self, meta_yaml) -> Optional[str]:
         if "github.com" not in meta_yaml["url"]:
             return None
         split_url = meta_yaml["url"].lower().split("/")
+        version = meta_yaml["version"]
+        self.set_version_prefix(version, split_url)
         package_owner = split_url[split_url.index("github.com") + 1]
         gh_package_name = split_url[split_url.index("github.com") + 2]
         return f"https://github.com/{package_owner}/{gh_package_name}/releases.atom"

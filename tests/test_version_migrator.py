@@ -1,12 +1,13 @@
+import logging
 import os
 import random
-import logging
+
 import pytest
 from flaky import flaky
+from test_migrators import run_test_migration
 
 from conda_forge_tick.migrators import Version
-
-from test_migrators import run_test_migration
+from conda_forge_tick.migrators.version import VersionMigrationError
 
 VERSION = Version(set())
 
@@ -78,7 +79,7 @@ def test_version_up(case, new_ver, tmpdir, caplog):
         kwargs=kwargs,
         prb="Dependencies have been updated if changed",
         mr_out={
-            "migrator_name": "Version",
+            "migrator_name": Version.name,
             "migrator_version": Version.migrator_version,
             "version": new_ver,
         },
@@ -108,23 +109,20 @@ def test_version_noup(case, new_ver, tmpdir, caplog):
     with open(os.path.join(YAML_PATH, "version_%s_correct.yaml" % case)) as fp:
         out_yaml = fp.read()
 
-    attrs = run_test_migration(
-        m=VERSION,
-        inp=in_yaml,
-        output=out_yaml,
-        kwargs={"new_version": new_ver},
-        prb="Dependencies have been updated if changed",
-        mr_out={},
-        tmpdir=tmpdir,
-    )
+    with pytest.raises(VersionMigrationError) as e:
+        run_test_migration(
+            m=VERSION,
+            inp=in_yaml,
+            output=out_yaml,
+            kwargs={"new_version": new_ver},
+            prb="Dependencies have been updated if changed",
+            mr_out={},
+            tmpdir=tmpdir,
+        )
 
-    print(
-        "\n\n"
-        + attrs.get("version_pr_info", {})
-        .get("new_version_errors", {})
-        .get(new_ver, "")
-        + "\n\n",
-    )
+    assert "The recipe did not change in the version migration," in str(
+        e.value
+    ), e.value
 
 
 def test_version_cupy(tmpdir, caplog):
@@ -152,7 +150,7 @@ def test_version_cupy(tmpdir, caplog):
         kwargs=kwargs,
         prb="Dependencies have been updated if changed",
         mr_out={
-            "migrator_name": "Version",
+            "migrator_name": Version.name,
             "migrator_version": Version.migrator_version,
             "version": new_ver,
         },
@@ -189,7 +187,7 @@ def test_version_rand_frac(tmpdir, caplog):
         kwargs=kwargs,
         prb="Dependencies have been updated if changed",
         mr_out={
-            "migrator_name": "Version",
+            "migrator_name": Version.name,
             "migrator_version": Version.migrator_version,
             "version": new_ver,
         },

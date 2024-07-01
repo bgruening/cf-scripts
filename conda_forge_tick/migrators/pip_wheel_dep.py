@@ -1,16 +1,22 @@
-import tempfile
 import functools
-from typing import Any, Dict
-from ruamel.yaml import YAML
+import logging
+import os
+import tempfile
 import typing
+from typing import Any, Dict
 
 import requests
+from ruamel.yaml import YAML
 
+from conda_forge_tick.lazy_json_backends import CF_TICK_GRAPH_GITHUB_BACKEND_BASE_URL
 from conda_forge_tick.migrators import MiniMigrator
 from conda_forge_tick.os_utils import pushd
+from conda_forge_tick.utils import get_keys_default
 
 if typing.TYPE_CHECKING:
     from conda_forge_tick.migrators_types import AttrsTypedDict
+
+logger = logging.getLogger(__name__)
 
 
 @functools.lru_cache()
@@ -21,7 +27,12 @@ def pypi_conda_mapping() -> Dict[str, str]:
     """
     yaml = YAML()
     content = requests.get(
-        "https://raw.githubusercontent.com/regro/cf-graph-countyfair/master/mappings/pypi/grayskull_pypi_mapping.yaml",  # noqa
+        os.path.join(
+            CF_TICK_GRAPH_GITHUB_BACKEND_BASE_URL,
+            "mappings",
+            "pypi",
+            "grayskull_pypi_mapping.yaml",
+        )
     ).text
     mappings = yaml.load(content)
     return {
@@ -32,27 +43,36 @@ def pypi_conda_mapping() -> Dict[str, str]:
 class PipWheelMigrator(MiniMigrator):
     post_migration = True
 
+    def _get_version(self, attrs: "AttrsTypedDict") -> str:
+        return (
+            attrs.get("new_version", "")
+            or attrs.get("version_pr_info", {}).get("new_version", "")
+            or attrs.get(
+                "version",
+                "",
+            )
+        )
+
     def filter(self, attrs: "AttrsTypedDict", not_bad_str_start: str = "") -> bool:
         run_reqs = attrs.get("requirements", {}).get("run", set())
         source_url = attrs.get("url") or attrs.get("source", {}).get("url")
         url_names = ["pypi.python.org", "pypi.org", "pypi.io"]
         if not any(s in source_url for s in url_names):
             return True
-        if (
-            not attrs.get("conda-forge.yml", {})
-            .get("bot", {})
-            .get("run_deps_from_wheel", False)
+        if not get_keys_default(
+            attrs,
+            ["conda-forge.yml", "bot", "run_deps_from_wheel"],
+            {},
+            False,
         ):
             return True
 
         if "python" not in run_reqs:
             return True
 
-        version = attrs.get("version_pr_info", {}).get("new_version", "") or attrs.get(
-            "version",
-            "",
-        )
-        wheel_url, wheel_file = self.determine_wheel(source_url, version)
+        version: str = self._get_version(attrs)
+        logger.debug(f"Checking if PyPI has a wheel for {version}")
+        wheel_url, _ = self.determine_wheel(source_url, version)
 
         if wheel_url is None:
             return True
@@ -77,10 +97,7 @@ class PipWheelMigrator(MiniMigrator):
 
     def migrate(self, recipe_dir: str, attrs: "AttrsTypedDict", **kwargs: Any) -> None:
         source_url = attrs.get("url") or attrs.get("source", {}).get("url")
-        version = attrs.get("version_pr_info", {}).get("new_version", "") or attrs.get(
-            "version",
-            "",
-        )
+        version = self._get_version(attrs)
         if not version:
             return None
 
@@ -95,8 +112,8 @@ class PipWheelMigrator(MiniMigrator):
             with open(wheel_file, "wb") as fp:
                 for chunk in resp.iter_content(chunk_size=2**16):
                     fp.write(chunk)
-            import pkginfo
             import pkg_resources
+            import pkginfo
 
             wheel_metadata = pkginfo.get_metadata(wheel_file)
             wheel_metadata.extractMetadata()

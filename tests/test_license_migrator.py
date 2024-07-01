@@ -1,10 +1,8 @@
 from flaky import flaky
-
-from conda_forge_tick.migrators import Version, LicenseMigrator
-from conda_forge_tick.migrators.license import _munge_licenses
-
 from test_migrators import run_test_migration
 
+from conda_forge_tick.migrators import LicenseMigrator, Version
+from conda_forge_tick.migrators.license import _munge_licenses
 
 LM = LicenseMigrator()
 VER_LM = Version(set(), piggy_back_migrations=[LM])
@@ -285,7 +283,7 @@ def test_version_license_correct(tmpdir):
         kwargs={"new_version": "0.9"},
         prb="Dependencies have been updated if changed",
         mr_out={
-            "migrator_name": "Version",
+            "migrator_name": Version.name,
             "migrator_version": Version.migrator_version,
             "version": "0.9",
         },
@@ -313,7 +311,7 @@ def test_version_license_correct_r(tmpdir):
         kwargs={"new_version": "0.9.2"},
         prb="Dependencies have been updated if changed",
         mr_out={
-            "migrator_name": "Version",
+            "migrator_name": Version.name,
             "migrator_version": Version.migrator_version,
             "version": "0.9.2",
         },

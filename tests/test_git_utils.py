@@ -1,8 +1,7 @@
-from conda_forge_tick.git_utils import trim_pr_josn_keys
+from conda_forge_tick.git_utils import trim_pr_json_keys
 
 
 def test_trim_pr_json_keys():
-
     pr_json = {
         "ETag": "blah",
         "Last-Modified": "flah",
@@ -12,7 +11,7 @@ def test_trim_pr_json_keys():
         "base": {"repo": {"namee": "None", "name": "foo"}},
     }
 
-    pr_json = trim_pr_josn_keys(pr_json)
+    pr_json = trim_pr_json_keys(pr_json)
     assert "random" not in pr_json
     assert pr_json["head"] == {}
     assert pr_json["base"]["repo"] == {"name": "foo"}
@@ -20,7 +19,6 @@ def test_trim_pr_json_keys():
 
 
 def test_trim_pr_json_keys_src():
-
     src_pr_json = {
         "ETag": "blah",
         "Last-Modified": "flah",
@@ -30,7 +28,7 @@ def test_trim_pr_json_keys_src():
         "base": {"repo": {"namee": "None", "name": "foo"}},
     }
 
-    pr_json = trim_pr_josn_keys({"r": None}, src_pr_json=src_pr_json)
+    pr_json = trim_pr_json_keys({"r": None}, src_pr_json=src_pr_json)
     assert "random" not in pr_json
     assert pr_json["head"] == {}
     assert pr_json["base"]["repo"] == {"name": "foo"}
