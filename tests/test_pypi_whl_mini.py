@@ -1,16 +1,11 @@
 import os
-from flaky import flaky
 
-import requests
 import pytest
+import requests
+from flaky import flaky
+from test_migrators import run_minimigrator, run_test_migration
 
-from test_migrators import run_test_migration, run_minimigrator
-
-
-from conda_forge_tick.migrators import (
-    Version,
-    PipWheelMigrator,
-)
+from conda_forge_tick.migrators import PipWheelMigrator, Version
 
 wheel_mig = PipWheelMigrator()
 
@@ -111,7 +106,7 @@ def test_migrate_opentelemetry(tmp_dir_with_conf):
         prb="Dependencies have been updated if changed",
         kwargs={"new_version": "0.23b2"},
         mr_out={
-            "migrator_name": "Version",
+            "migrator_name": Version.name,
             "migrator_version": Version.migrator_version,
             "version": "0.23b2",
         },

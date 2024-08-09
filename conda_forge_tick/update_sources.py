@@ -1,38 +1,33 @@
 import abc
 import collections.abc
-import subprocess
-import re
 import copy
-import logging
-import urllib.parse
-import typing
 import functools
-from typing import (
-    Optional,
-    Set,
-    Iterator,
-    List,
-)
-import yaml
+import logging
+import re
+import subprocess
+import typing
+import urllib.parse
+from typing import Iterator, List, Optional
+
 import feedparser
 import requests
+import yaml
 from conda.models.version import VersionOrder
-from conda_forge_tick.utils import parse_meta_yaml
-from .hashing import hash_url
 
 # TODO: parse_version has bad type annotations
 from pkg_resources import parse_version
 
+from conda_forge_tick.utils import parse_meta_yaml
+
+from .hashing import hash_url
+
 if typing.TYPE_CHECKING:
-    from conda_forge_tick.migrators_types import (
-        MetaYamlTypedDict,
-        SourceTypedDict,
-    )
+    from conda_forge_tick.migrators_types import RecipeTypedDict, SourceTypedDict
 
 
 CRAN_INDEX: Optional[dict] = None
 
-logger = logging.getLogger("conda_forge_tick._update_version.update_sources")
+logger = logging.getLogger(__name__)
 
 CURL_ONLY_URL_SLUGS = [
     "https://eups.lsst.codes/",
@@ -40,7 +35,7 @@ CURL_ONLY_URL_SLUGS = [
 ]
 
 
-def urls_from_meta(meta_yaml: "MetaYamlTypedDict") -> Set[str]:
+def urls_from_meta(meta_yaml: "RecipeTypedDict") -> set[str]:
     source: "SourceTypedDict" = meta_yaml["source"]
     sources: typing.List["SourceTypedDict"]
     if isinstance(source, collections.abc.Mapping):
@@ -70,15 +65,12 @@ def next_version(ver: str, increment_alpha: bool = False) -> Iterator[str]:
     ver_dot_split = ver.split(".")
     n_dot = len(ver_dot_split)
     for idot, sdot in enumerate(ver_dot_split):
-
         ver_under_split = sdot.split("_")
         n_under = len(ver_under_split)
         for iunder, sunder in enumerate(ver_under_split):
-
             ver_dash_split = sunder.split("-")
             n_dash = len(ver_dash_split)
             for idash, sdash in enumerate(ver_dash_split):
-
                 for el in _split_alpha_num(sdash):
                     ver_split.append(el)
 
@@ -91,7 +83,7 @@ def next_version(ver: str, increment_alpha: bool = False) -> Iterator[str]:
         if idot < n_dot - 1:
             ver_split.append(".")
 
-    def _yeild_splits_from_index(start, ver_split_start, num_bump):
+    def _yield_splits_from_index(start, ver_split_start, num_bump):
         if start < len(ver_split_start) and num_bump > 0:
             ver_split = copy.deepcopy(ver_split_start)
             for k in reversed(range(start, len(ver_split))):
@@ -105,7 +97,7 @@ def next_version(ver: str, increment_alpha: bool = False) -> Iterator[str]:
                     for kk in range(num_bump):
                         ver_split[k] = str(t + 1 + kk)
                         yield "".join(ver_split)
-                        yield from _yeild_splits_from_index(
+                        yield from _yield_splits_from_index(
                             k + 1,
                             ver_split,
                             num_bump - 1,
@@ -119,7 +111,7 @@ def next_version(ver: str, increment_alpha: bool = False) -> Iterator[str]:
                     for kk in range(num_bump):
                         ver_split[k] = chr(ord(ver_split[k]) + 1)
                         yield "".join(ver_split)
-                        yield from _yeild_splits_from_index(
+                        yield from _yield_splits_from_index(
                             k + 1,
                             ver_split,
                             num_bump - 1,
@@ -128,7 +120,7 @@ def next_version(ver: str, increment_alpha: bool = False) -> Iterator[str]:
                 else:
                     continue
 
-    for ver in _yeild_splits_from_index(0, ver_split, 2):
+    for ver in _yield_splits_from_index(0, ver_split, 2):
         yield ver
 
 
@@ -144,7 +136,7 @@ class AbstractSource(abc.ABC):
         pass
 
 
-class VersionFromFeed(AbstractSource):
+class VersionFromFeed(AbstractSource, abc.ABC):
     name = "VersionFromFeed"
     ver_prefix_remove = ["release-", "releases%2F", "v_", "v.", "v"]
     dev_vers = [
@@ -159,6 +151,7 @@ class VersionFromFeed(AbstractSource):
         "test",
         "pre",
         "git",
+        "pc",
     ]
 
     def get_version(self, url) -> Optional[str]:
@@ -339,7 +332,7 @@ class ROSDistro(AbstractSource):
                 logger.error("ROS Distro initialization failed", exc_info=True)
                 ROS_DISTRO_INDEX = {}
 
-    def get_url(self, meta_yaml: "MetaYamlTypedDict") -> Optional[str]:
+    def get_url(self, meta_yaml: "RecipeTypedDict") -> Optional[str]:
         if not meta_yaml["name"].startswith("ros-"):
             return None
 
@@ -390,7 +383,8 @@ def url_exists(url: str, timeout=2) -> bool:
                 stderr=subprocess.STDOUT,
                 timeout=timeout,
             )
-        except Exception:
+        except Exception as e:
+            logger.debug("url_exists wget exception", exc_info=e)
             return False
         # For FTP servers an exception is not thrown
         if "No such file" in output.decode("utf-8"):
@@ -406,7 +400,8 @@ def url_exists(url: str, timeout=2) -> bool:
                 capture_output=True,
                 check=True,
             )
-        except subprocess.CalledProcessError:
+        except subprocess.CalledProcessError as e:
+            logger.debug("url_exists curl exception", exc_info=e)
             return False
 
         return True
@@ -558,14 +553,67 @@ class IncrementAlphaRawURL(BaseRawURL):
 
 class Github(VersionFromFeed):
     name = "Github"
+    version_prefix = None
+
+    def set_version_prefix(self, version: str, split_url: list[str]):
+        self.version_prefix = self.get_version_prefix(version, split_url)
+        if self.version_prefix is None:
+            return
+        logger.debug(f"Found version prefix from url: {self.version_prefix}")
+        self.ver_prefix_remove = [self.version_prefix] + self.ver_prefix_remove
+
+    def get_version_prefix(self, version: str, split_url: list[str]):
+        """Returns prefix for the first split that contains version. If prefix
+        is empty - returns None."""
+        r = re.compile(rf"^(.*){version}")
+        for split in split_url:
+            match = r.match(split)
+            if match is not None:
+                if match.group(1) == "":
+                    return None
+                return match.group(1)
+
+        return None
 
     def get_url(self, meta_yaml) -> Optional[str]:
         if "github.com" not in meta_yaml["url"]:
             return None
         split_url = meta_yaml["url"].lower().split("/")
+        version = meta_yaml["version"]
+        self.set_version_prefix(version, split_url)
         package_owner = split_url[split_url.index("github.com") + 1]
         gh_package_name = split_url[split_url.index("github.com") + 2]
         return f"https://github.com/{package_owner}/{gh_package_name}/releases.atom"
+
+
+class GithubReleases(AbstractSource):
+    name = "GithubReleases"
+
+    def get_url(self, meta_yaml) -> Optional[str]:
+        if "github.com" not in meta_yaml["url"]:
+            return None
+        # might be namespaced
+        owner, repo = meta_yaml["url"].split("/")[3:5]
+        return f"https://github.com/{owner}/{repo}/releases/latest"
+
+    def get_version(self, url: str) -> Optional[str]:
+        r = requests.get(url)
+        if not r.ok:
+            return False
+        # "/releases/latest" redirects to "/releases/tag/<tag name>"
+        url_components = r.url.split("/")
+        latest = "/".join(url_components[url_components.index("releases") + 2 :])
+        # If it is a pre-release don't give back the pre-release version
+        if not len(latest) or latest == "latest" or parse_version(latest).is_prerelease:
+            return False
+        for prefix in ("v", "release-", "releases/"):
+            if latest.startswith(prefix):
+                latest = latest[len(prefix) :]
+                break
+        # Extract version number starting at the first digit.
+        if match := re.search(r"(\d+[^\s]*)", latest):
+            latest = match.group(0)
+        return latest
 
 
 class LibrariesIO(VersionFromFeed):

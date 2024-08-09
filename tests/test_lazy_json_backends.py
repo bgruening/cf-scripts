@@ -1,33 +1,47 @@
-import os
-import json
-import pickle
 import hashlib
-
-from conda_forge_tick.lazy_json_backends import (
-    LazyJson,
-    dumps,
-    loads,
-    load,
-    dump,
-    get_sharded_path,
-    get_all_keys_for_hashmap,
-    remove_key_for_hashmap,
-    lazy_json_snapshot,
-    lazy_json_transaction,
-    MongoDBLazyJsonBackend,
-    LAZY_JSON_BACKENDS,
-    sync_lazy_json_across_backends,
-    lazy_json_override_backends,
-    get_lazy_json_backends,
-    get_lazy_json_primary_backend,
-)
-from conda_forge_tick.os_utils import pushd
-import conda_forge_tick.utils
+import json
+import logging
+import os
+import pickle
+from unittest import mock
+from unittest.mock import MagicMock
 
 import pytest
 
+import conda_forge_tick
+import conda_forge_tick.utils
+from conda_forge_tick.lazy_json_backends import (
+    CF_TICK_GRAPH_GITHUB_BACKEND_BASE_URL,
+    LAZY_JSON_BACKENDS,
+    GithubLazyJsonBackend,
+    LazyJson,
+    MongoDBLazyJsonBackend,
+    dump,
+    dumps,
+    get_all_keys_for_hashmap,
+    get_lazy_json_backends,
+    get_lazy_json_primary_backend,
+    get_sharded_path,
+    lazy_json_override_backends,
+    lazy_json_snapshot,
+    lazy_json_transaction,
+    load,
+    loads,
+    remove_key_for_hashmap,
+    sync_lazy_json_across_backends,
+)
+from conda_forge_tick.os_utils import pushd
 
-@pytest.mark.skipif("MONGODB_CONNECTION_STRING" not in os.environ, reason="no mongodb")
+HAVE_MONGODB = (
+    "MONGODB_CONNECTION_STRING" in conda_forge_tick.global_sensitive_env.classified_info
+    and conda_forge_tick.global_sensitive_env.classified_info[
+        "MONGODB_CONNECTION_STRING"
+    ]
+    is not None
+)
+
+
+@pytest.mark.skipif(not HAVE_MONGODB, reason="no mongodb")
 def test_lazy_json_override_backends_global(tmpdir):
     old_backend = conda_forge_tick.lazy_json_backends.CF_TICK_GRAPH_DATA_BACKENDS
     with pushd(tmpdir):
@@ -96,6 +110,26 @@ def test_lazy_json_override_backends_global(tmpdir):
 
             assert be.hget("lazy_json", "blah") == pbe.hget("lazy_json", "blah")
             assert be.hget("lazy_json", "blah") == dumps({"hello": "me again"})
+
+            with lazy_json_override_backends(
+                ["file"], hashmaps_to_sync=["lazy_json"], keys_to_sync=set()
+            ):
+                assert (
+                    conda_forge_tick.lazy_json_backends.CF_TICK_GRAPH_DATA_BACKENDS
+                    == ("file",)
+                )
+                assert (
+                    conda_forge_tick.lazy_json_backends.CF_TICK_GRAPH_DATA_PRIMARY_BACKEND
+                    == "file"
+                )
+                assert get_lazy_json_backends() == ("file",)
+                assert get_lazy_json_primary_backend() == "file"
+                with lzj as attrs:
+                    attrs["hello"] = "me again again"
+
+            assert be.hget("lazy_json", "blah") != pbe.hget("lazy_json", "blah")
+            assert be.hget("lazy_json", "blah") == dumps({"hello": "me again again"})
+
         finally:
             be = LAZY_JSON_BACKENDS["mongodb"]()
             be.hdel("lazy_json", ["blah"])
@@ -108,7 +142,66 @@ def test_lazy_json_override_backends_global(tmpdir):
             )
 
 
-@pytest.mark.skipif("MONGODB_CONNECTION_STRING" not in os.environ, reason="no mongodb")
+@pytest.mark.skipif(not HAVE_MONGODB, reason="no mongodb")
+def test_lazy_json_override_backends_global_nocache(tmpdir):
+    old_backend = conda_forge_tick.lazy_json_backends.CF_TICK_GRAPH_DATA_BACKENDS
+    with pushd(tmpdir):
+        try:
+            conda_forge_tick.lazy_json_backends.CF_TICK_GRAPH_DATA_BACKENDS = (
+                "mongodb",
+            )
+            conda_forge_tick.lazy_json_backends.CF_TICK_GRAPH_DATA_PRIMARY_BACKEND = (
+                "mongodb"
+            )
+
+            lzj = LazyJson("blah.json")
+            with lzj as attrs:
+                attrs["hello"] = "world"
+            pbe = LAZY_JSON_BACKENDS["mongodb"]()
+            be = LAZY_JSON_BACKENDS["file"]()
+
+            assert be.hget("lazy_json", "blah") == pbe.hget("lazy_json", "blah")
+            assert be.hget("lazy_json", "blah") == dumps({"hello": "world"})
+
+            with lazy_json_override_backends(["mongodb"], use_file_cache=False):
+                assert (
+                    conda_forge_tick.lazy_json_backends.CF_TICK_GRAPH_DATA_BACKENDS
+                    == ("mongodb",)
+                )
+                assert (
+                    conda_forge_tick.lazy_json_backends.CF_TICK_GRAPH_DATA_PRIMARY_BACKEND
+                    == "mongodb"
+                )
+                used_cache = getattr(
+                    conda_forge_tick.lazy_json_backends,
+                    "CF_TICK_GRAPH_DATA_USE_FILE_CACHE",
+                )
+                assert not used_cache
+                assert get_lazy_json_backends() == ("mongodb",)
+                assert get_lazy_json_primary_backend() == "mongodb"
+                lzj = LazyJson("blah2.json")
+                with lzj as attrs:
+                    attrs["hello"] = "world"
+
+                assert not be.hexists("lazy_json", "blah2")
+                assert be.hexists("lazy_json", "blah")
+                assert pbe.hexists("lazy_json", "blah")
+        finally:
+            for bename in ["file", "mongodb"]:
+                for key in ["blah", "blah2"]:
+                    be = LAZY_JSON_BACKENDS[bename]()
+                    if be.hexists("lazy_json", key):
+                        be.hdel("lazy_json", [key])
+
+            conda_forge_tick.lazy_json_backends.CF_TICK_GRAPH_DATA_BACKENDS = (
+                old_backend
+            )
+            conda_forge_tick.lazy_json_backends.CF_TICK_GRAPH_DATA_PRIMARY_BACKEND = (
+                old_backend[0]
+            )
+
+
+@pytest.mark.skipif(not HAVE_MONGODB, reason="no mongodb")
 @pytest.mark.parametrize(
     "backends",
     [
@@ -163,7 +256,7 @@ def test_lazy_json_backends_sync(backends, tmpdir):
         pytest.param(
             "mongodb",
             marks=pytest.mark.skipif(
-                "MONGODB_CONNECTION_STRING" not in os.environ,
+                not HAVE_MONGODB,
                 reason="no mongodb",
             ),
         ),
@@ -230,7 +323,7 @@ def test_lazy_json_backends_ops(backend, hashmap, tmpdir):
         pytest.param(
             "mongodb",
             marks=pytest.mark.skipif(
-                "MONGODB_CONNECTION_STRING" not in os.environ,
+                not HAVE_MONGODB,
                 reason="no mongodb",
             ),
         ),
@@ -319,7 +412,7 @@ def test_lazy_json_backends_dump_load(tmpdir):
         pytest.param(
             "mongodb",
             marks=pytest.mark.skipif(
-                "MONGODB_CONNECTION_STRING" not in os.environ,
+                not HAVE_MONGODB,
                 reason="no mongodb",
             ),
         ),
@@ -409,6 +502,9 @@ def test_lazy_json(tmpdir, backend):
             assert len(lj) == 0
             assert not lj
         finally:
+            be = LAZY_JSON_BACKENDS[backend]()
+            be.hdel("lazy_json", ["hi"])
+
             conda_forge_tick.lazy_json_backends.CF_TICK_GRAPH_DATA_BACKENDS = (
                 old_backend
             )
@@ -506,3 +602,172 @@ def test_lazy_json_backends_hashmap(tmpdir):
         assert get_all_keys_for_hashmap("lazy_json") == ["blah"]
         remove_key_for_hashmap("lazy_json", "blah")
         assert get_all_keys_for_hashmap("lazy_json") == []
+
+
+def test_github_base_url() -> None:
+    github_backend = GithubLazyJsonBackend()
+    assert github_backend.base_url == CF_TICK_GRAPH_GITHUB_BACKEND_BASE_URL + "/"
+    github_backend.base_url = "https://github.com/lorem/ipsum"
+    assert github_backend.base_url == "https://github.com/lorem/ipsum" + "/"
+
+
+@pytest.mark.parametrize(
+    "name, key",
+    [
+        ("node_attrs", "flask"),
+        ("node_attrs", "requests"),
+        ("node_attrs", "boto3"),
+        ("node_attrs", "setuptools"),
+    ],
+)
+def test_github_online_hexists_success(
+    name: str,
+    key: str,
+) -> None:
+    # this performs a web request
+    assert GithubLazyJsonBackend().hexists(name, key)
+
+
+@pytest.mark.parametrize(
+    "name, key",
+    [
+        ("node_attrs", "this-package-will-not-ever-exist-invalid"),
+        ("invalid-name", "flask"),
+    ],
+)
+def test_github_online_hexists_failure(name: str, key: str) -> None:
+    # this performs a web request
+    assert not GithubLazyJsonBackend().hexists(name, key)
+
+
+@mock.patch("requests.head")
+def test_github_hexists_unexpected_status_code(request_mock: MagicMock) -> None:
+    request_mock.return_value.status_code = 500
+
+    with pytest.raises(RuntimeError, match="Unexpected status code 500"):
+        GithubLazyJsonBackend().hexists("name", "key")
+
+
+@pytest.fixture
+def reset_github_backend():
+    # In the future, the program architecture should be changed such that backend instances are shared, instead of
+    # instantiating each backend multiple times (whenever it is needed). Then, this can be moved into instance
+    # variables that don't need to be reset.
+    GithubLazyJsonBackend._write_warned = False
+    GithubLazyJsonBackend._n_requests = 0
+
+
+def test_github_hdel(caplog, reset_github_backend) -> None:
+    caplog.set_level(logging.DEBUG)
+    backend = GithubLazyJsonBackend()
+    backend.hdel("name", ["key1", "key2"])
+
+    assert "Write operations to the GitHub online backend are ignored." in caplog.text
+
+    backend.hdel("name2", ["key3"])
+
+    # warning should only be once in log
+    assert (
+        caplog.text.count("Write operations to the GitHub online backend are ignored")
+        == 1
+    )
+
+
+def test_github_hmset(caplog, reset_github_backend) -> None:
+    caplog.set_level(logging.DEBUG)
+    backend = GithubLazyJsonBackend()
+    backend.hmset("name", {"a": "b"})
+
+    assert "Write operations to the GitHub online backend are ignored." in caplog.text
+
+    backend.hmset("name2", {})
+
+    # warning should only be once in log
+    assert (
+        caplog.text.count("Write operations to the GitHub online backend are ignored")
+        == 1
+    )
+
+
+def test_github_hset(caplog, reset_github_backend) -> None:
+    caplog.set_level(logging.DEBUG)
+    backend = GithubLazyJsonBackend()
+    backend.hset("name", "key", "value")
+
+    assert "Write operations to the GitHub online backend are ignored." in caplog.text
+
+    backend.hset("name", "key", "value2")
+
+    # warning should only be once in log
+    assert (
+        caplog.text.count("Write operations to the GitHub online backend are ignored")
+        == 1
+    )
+
+
+def test_github_write_mix(caplog, reset_github_backend) -> None:
+    caplog.set_level(logging.DEBUG)
+    backend = GithubLazyJsonBackend()
+
+    backend.hset("name", "key", "value")
+    backend.hdel("name", ["a", "b"])
+    backend.hmset("name2", {"a": "d"})
+    backend.hset("name", "key", "value")
+    backend.hdel("name3", ["a", "b"])
+    backend.hmset("name", {"a": "d"})
+
+    # warning should only be once in log
+    assert (
+        caplog.text.count("Write operations to the GitHub online backend are ignored")
+        == 1
+    )
+
+
+def test_github_hkeys() -> None:
+    with pytest.raises(NotImplementedError):
+        assert GithubLazyJsonBackend().hkeys("name") == []
+
+
+def test_github_hgetall() -> None:
+    with pytest.raises(NotImplementedError):
+        GithubLazyJsonBackend().hgetall("name")
+
+
+@mock.patch("requests.get")
+def test_github_hget_success(
+    mock_get: MagicMock,
+) -> None:
+    backend = GithubLazyJsonBackend()
+    backend.base_url = "https://github.com/lorem/ipsum"
+    mock_get.return_value.status_code = 200
+    mock_get.return_value.text = "{'key': 'value'}"
+    assert backend.hget("name", "key") == "{'key': 'value'}"
+    mock_get.assert_called_once_with(
+        "https://github.com/lorem/ipsum/name/4/4/0/9/d/key.json",
+    )
+
+
+@mock.patch("requests.get")
+def test_github_offline_hget_not_found(
+    mock_get: MagicMock,
+) -> None:
+    backend = GithubLazyJsonBackend()
+    backend.base_url = "https://github.com/lorem/ipsum"
+    mock_get.return_value.status_code = 404
+    with pytest.raises(KeyError):
+        backend.hget("name", "key")
+    mock_get.assert_called_once_with(
+        "https://github.com/lorem/ipsum/name/4/4/0/9/d/key.json",
+    )
+
+
+@pytest.mark.parametrize(
+    "name, key",
+    [
+        ("node_attrs", "this-package-will-not-ever-exist-invalid"),
+        ("invalid-name", "flask"),
+    ],
+)
+def test_github_online_hget_not_found(name: str, key: str):
+    with pytest.raises(KeyError):
+        GithubLazyJsonBackend().hget(name, key)

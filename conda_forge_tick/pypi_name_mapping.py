@@ -4,24 +4,32 @@ Builds and maintains mapping of pypi-names to conda-forge names
 1: Packages should be build from a `https://pypi.io/packages/` source
 2: Packages MUST have a test: imports section importing it
 """
+
+import functools
 import json
 import math
-import requests
-import yaml
+import os
 import pathlib
 import traceback
-import functools
-
 from collections import Counter, defaultdict
-from typing import Dict, List, Literal, Optional, Any, Tuple, Set, TypedDict, Union
 from os.path import commonprefix
-from packaging.utils import (
-    canonicalize_name as canonicalize_pypi_name,
-    NormalizedName as PypiName,
-)
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple, TypedDict, Union
 
-from .utils import as_iterable, load_graph
-from .lazy_json_backends import dump, loads, get_all_keys_for_hashmap, LazyJson
+import requests
+import yaml
+from packaging.utils import NormalizedName as PypiName
+from packaging.utils import canonicalize_name as canonicalize_pypi_name
+
+from .import_to_pkg import IMPORT_TO_PKG_DIR_CLOBBERING
+from .lazy_json_backends import (
+    CF_TICK_GRAPH_DATA_BACKENDS,
+    CF_TICK_GRAPH_GITHUB_BACKEND_BASE_URL,
+    LazyJson,
+    dump,
+    get_all_keys_for_hashmap,
+    loads,
+)
+from .utils import as_iterable, load_existing_graph
 
 
 class Mapping(TypedDict):
@@ -299,16 +307,24 @@ def determine_best_matches_for_pypi_import(
         map_by_conda_name[conda_name] = m
 
     graph_file = str(pathlib.Path(".") / "graph.json")
-    gx = load_graph(graph_file)
+    gx = load_existing_graph(graph_file)
     # TODO: filter out archived feedstocks?
 
     try:
-        clobberers = loads(
-            requests.get(
-                "https://raw.githubusercontent.com/regro/libcfgraph/master/"
-                "clobbering_pkgs.json",
-            ).text,
-        )
+        if "file" in CF_TICK_GRAPH_DATA_BACKENDS and os.path.exists(
+            IMPORT_TO_PKG_DIR_CLOBBERING
+        ):
+            with open(IMPORT_TO_PKG_DIR_CLOBBERING) as fp:
+                clobberers = loads(fp.read())
+        else:
+            clobberers = loads(
+                requests.get(
+                    os.path.join(
+                        CF_TICK_GRAPH_GITHUB_BACKEND_BASE_URL,
+                        IMPORT_TO_PKG_DIR_CLOBBERING,
+                    )
+                ).text,
+            )
     except Exception as e:
         print(e)
         clobberers = set()
@@ -395,7 +411,7 @@ def determine_best_matches_for_pypi_import(
     return final_map, ordered_import_names
 
 
-def main(args) -> None:
+def main() -> None:
     # Statically defined mappings from pypi_name_mapping_static.yaml
     static_packager_mappings: List[Mapping] = load_static_mappings()
 
@@ -437,8 +453,3 @@ def main(args) -> None:
                 sorted(ordered_import_names, key=lambda entry: entry["import_name"]),
                 fp,
             )
-
-
-if __name__ == "__main__":
-    # main()
-    pass

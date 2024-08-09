@@ -1,18 +1,43 @@
-import os
-import hashlib
-import glob
-import subprocess
-import functools
-import logging
 import contextlib
+import functools
+import glob
+import hashlib
+import logging
+import os
+import subprocess
+import urllib
+from abc import ABC, abstractmethod
+from collections.abc import Callable, MutableMapping
+from typing import (
+    IO,
+    Any,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Set,
+    Union,
+)
 
-from typing import Any, Union, Optional, IO, Set, Iterator
-from collections.abc import MutableMapping, Callable
-
+import networkx as nx
 import rapidjson as json
+import requests
 
-LOGGER = logging.getLogger("conda_forge_tick.lazy_json_backends")
+from .cli_context import CliContext
+from .executors import lock_git_operation
 
+logger = logging.getLogger(__name__)
+
+CF_TICK_GRAPH_DATA_USE_FILE_CACHE = (
+    False
+    if (
+        "CF_TICK_GRAPH_DATA_USE_FILE_CACHE" in os.environ
+        and os.environ["CF_TICK_GRAPH_DATA_USE_FILE_CACHE"].lower() in ["false", "0"]
+    )
+    else True
+)
 CF_TICK_GRAPH_DATA_BACKENDS = tuple(
     os.environ.get("CF_TICK_GRAPH_DATA_BACKENDS", "file").split(":"),
 )
@@ -24,10 +49,16 @@ CF_TICK_GRAPH_DATA_HASHMAPS = [
     "version_pr_info",
     "versions",
     "node_attrs",
+    "migrators",
 ]
 
+CF_TICK_GRAPH_GITHUB_BACKEND_BASE_URL = (
+    "https://github.com/regro/cf-graph-countyfair/raw/master"
+)
+CF_TICK_GRAPH_GITHUB_BACKEND_NUM_DIRS = 5
 
-def get_sharded_path(file_path, n_dirs=5):
+
+def get_sharded_path(file_path, n_dirs=CF_TICK_GRAPH_GITHUB_BACKEND_NUM_DIRS):
     """computed a sharded location for the LazyJson file."""
     top_dir, file_name = os.path.split(file_path)
 
@@ -39,80 +70,86 @@ def get_sharded_path(file_path, n_dirs=5):
         return os.path.join(*pth_parts)
 
 
-class LazyJsonBackend:
+class LazyJsonBackend(ABC):
     @contextlib.contextmanager
-    def transaction_context(self):
-        raise NotImplementedError
+    @abstractmethod
+    def transaction_context(self) -> "Iterator[LazyJsonBackend]":
+        pass
 
     @contextlib.contextmanager
-    def snapshot_context(self):
-        raise NotImplementedError
+    @abstractmethod
+    def snapshot_context(self) -> "Iterator[LazyJsonBackend]":
+        pass
 
-    def hexists(self, name, key):
-        raise NotImplementedError
+    @abstractmethod
+    def hexists(self, name: str, key: str) -> bool:
+        pass
 
-    def hset(self, name, key, value):
-        raise NotImplementedError
+    @abstractmethod
+    def hset(self, name: str, key: str, value: str) -> None:
+        pass
 
-    def hmset(self, name, mapping):
-        raise NotImplementedError
+    @abstractmethod
+    def hmset(self, name: str, mapping: Mapping[str, str]) -> None:
+        pass
 
-    def hmget(self, name, keys):
-        raise NotImplementedError
+    @abstractmethod
+    def hmget(self, name: str, keys: Iterable[str]) -> List[str]:
+        pass
 
-    def hdel(self, name, keys):
-        raise NotImplementedError
+    @abstractmethod
+    def hdel(self, name: str, keys: Iterable[str]) -> None:
+        pass
 
-    def hkeys(self, name):
-        raise NotImplementedError
+    @abstractmethod
+    def hkeys(self, name: str) -> List[str]:
+        pass
 
-    def hsetnx(self, name, key, value):
+    def hsetnx(self, name: str, key: str, value: str) -> bool:
         if self.hexists(name, key):
             return False
         else:
             self.hset(name, key, value)
             return True
 
-    def hget(self, name, key):
-        raise NotImplementedError
+    @abstractmethod
+    def hget(self, name: str, key: str) -> str:
+        pass
 
-    def hgetall(self, name, hashval=False):
-        raise NotImplementedError
+    @abstractmethod
+    def hgetall(self, name: str, hashval: bool = False) -> Dict[str, str]:
+        pass
 
 
 class FileLazyJsonBackend(LazyJsonBackend):
     @contextlib.contextmanager
-    def transaction_context(self):
-        try:
-            yield self
-        finally:
-            pass
+    def transaction_context(self) -> "Iterator[FileLazyJsonBackend]":
+        # context not required
+        yield self
 
     @contextlib.contextmanager
-    def snapshot_context(self):
-        try:
-            yield self
-        finally:
-            pass
+    def snapshot_context(self) -> "Iterator[FileLazyJsonBackend]":
+        # context not required
+        yield self
 
-    def hexists(self, name, key):
+    def hexists(self, name: str, key: str) -> bool:
         return os.path.exists(get_sharded_path(f"{name}/{key}.json"))
 
-    def hset(self, name, key, value):
+    def hset(self, name: str, key: str, value: str) -> None:
         sharded_path = get_sharded_path(f"{name}/{key}.json")
         if os.path.split(sharded_path)[0]:
             os.makedirs(os.path.split(sharded_path)[0], exist_ok=True)
         with open(sharded_path, "w") as f:
             f.write(value)
 
-    def hmset(self, name, mapping):
+    def hmset(self, name: str, mapping: Mapping[str, str]) -> None:
         for key, value in mapping.items():
             self.hset(name, key, value)
 
-    def hmget(self, name, keys):
+    def hmget(self, name: str, keys: Iterable[str]) -> List[str]:
         return [self.hget(name, key) for key in keys]
 
-    def hgetall(self, name, hashval=False):
+    def hgetall(self, name: str, hashval: bool = False) -> Dict[str, str]:
         return {
             key: (
                 hashlib.sha256(self.hget(name, key).encode("utf-8")).hexdigest()
@@ -122,23 +159,19 @@ class FileLazyJsonBackend(LazyJsonBackend):
             for key in self.hkeys(name)
         }
 
-    def hdel(self, name, keys):
-        from .executors import PRLOCK, TRLOCK, DLOCK
-
-        lzj_names = " ".join(get_sharded_path(f"{name}/{key}.json") for key in keys)
-        with PRLOCK, DLOCK, TRLOCK:
+    def hdel(self, name: str, keys: Iterable[str]) -> None:
+        lzj_names = [get_sharded_path(f"{name}/{key}.json") for key in keys]
+        with lock_git_operation():
             subprocess.run(
-                "git rm --ignore-unmatch -f " + lzj_names,
-                shell=True,
+                ["git", "rm", "--ignore-unmatch", "-f"] + lzj_names,
                 capture_output=True,
             )
         subprocess.run(
-            "rm -f " + lzj_names,
-            shell=True,
+            ["rm", "-f"] + lzj_names,
             capture_output=True,
         )
 
-    def hkeys(self, name):
+    def hkeys(self, name: str) -> List[str]:
         jlen = len(".json")
         if name == "lazy_json":
             fnames = glob.glob("*.json")
@@ -150,19 +183,135 @@ class FileLazyJsonBackend(LazyJsonBackend):
             fnames = glob.glob(os.path.join(name, "**/*.json"), recursive=True)
         return [os.path.basename(fname)[:-jlen] for fname in fnames]
 
-    def hget(self, name, key):
+    def hget(self, name: str, key: str) -> str:
         sharded_path = get_sharded_path(f"{name}/{key}.json")
         with open(sharded_path) as f:
             data_str = f.read()
         return data_str
 
 
+class GithubLazyJsonBackend(LazyJsonBackend):
+    """
+    Read-only backend that makes live requests to https://raw.githubusercontent.com
+    URLs for serving JSON files.
+
+    Any write operations are ignored!
+    """
+
+    _write_warned = False
+    _n_requests = 0
+
+    def __init__(self) -> None:
+        self.base_url = CF_TICK_GRAPH_GITHUB_BACKEND_BASE_URL
+
+    @property
+    def base_url(self) -> str:
+        return self._base_url
+
+    @base_url.setter
+    def base_url(self, value: str) -> None:
+        if not value.endswith("/"):
+            value += "/"
+        self._base_url = value
+
+    @classmethod
+    def _ignore_write(cls) -> None:
+        if cls._write_warned:
+            return
+        logger.info("Note: Write operations to the GitHub online backend are ignored.")
+        cls._write_warned = True
+
+    @classmethod
+    def _inform_web_request(cls):
+        cls._n_requests += 1
+        if cls._n_requests % 20 == 0:
+            logger.info(
+                f"Made {cls._n_requests} requests to the GitHub online backend.",
+            )
+        if cls._n_requests == 20:
+            logger.warning(
+                "Using the GitHub online backend for making a lot of requests "
+                "is not recommended.",
+            )
+
+    def transaction_context(self) -> "Iterator[GithubLazyJsonBackend]":
+        # context not required
+        yield self
+
+    def snapshot_context(self) -> "Iterator[GithubLazyJsonBackend]":
+        # context not required
+        yield self
+
+    def hexists(self, name: str, key: str) -> bool:
+        self._inform_web_request()
+        url = urllib.parse.urljoin(
+            self.base_url,
+            get_sharded_path(f"{name}/{key}.json"),
+        )
+        status = requests.head(url, allow_redirects=True).status_code
+
+        if status == 200:
+            return True
+        if status == 404:
+            return False
+
+        raise RuntimeError(f"Unexpected status code {status} for {url}")
+
+    def hset(self, name: str, key: str, value: str) -> None:
+        self._ignore_write()
+
+    def hmset(self, name: str, mapping: Mapping[str, str]) -> None:
+        self._ignore_write()
+
+    def hmget(self, name: str, keys: Iterable[str]) -> List[str]:
+        return [self.hget(name, key) for key in keys]
+
+    def hdel(self, name: str, keys: Iterable[str]) -> None:
+        self._ignore_write()
+
+    def hkeys(self, name: str) -> List[str]:
+        """
+        Not implemented for GithubLazyJsonBackend.
+        Raises an error.
+        """
+        raise NotImplementedError(
+            "hkeys not implemented for GitHub JSON backend."
+            "You cannot use the GitHub backend with operations that "
+            "require listing all hashmap keys."
+        )
+
+    def hget(self, name: str, key: str) -> str:
+        self._inform_web_request()
+        sharded_path = get_sharded_path(f"{name}/{key}.json")
+        url = urllib.parse.urljoin(self.base_url, sharded_path)
+        r = requests.get(url)
+        if r.status_code == 404:
+            raise KeyError(f"Key {key} not found in hashmap {name}")
+        r.raise_for_status()
+        return r.text
+
+    def hgetall(self, name: str, hashval: bool = False) -> Dict[str, str]:
+        """
+        Not implemented for GithubLazyJsonBackend.
+        Raises an error.
+        """
+        raise NotImplementedError(
+            "hgetall not implemented for GitHub JSON backend."
+            "You cannot use the GitHub backend as source or target "
+            "for hashmap synchronization or other"
+            "commands that require listing all hashmap keys.",
+        )
+
+
 @functools.lru_cache(maxsize=128)
 def _get_graph_data_mongodb_client_cached(pid):
-    from pymongo import MongoClient
     import pymongo
+    from pymongo import MongoClient
 
-    client = MongoClient(os.environ["MONGODB_CONNECTION_STRING"])
+    from . import sensitive_env
+
+    with sensitive_env() as env:
+        client = MongoClient(env.get("MONGODB_CONNECTION_STRING", ""))
 
     db = client["cf_graph"]
     for hashmap in CF_TICK_GRAPH_DATA_HASHMAPS + ["lazy_json"]:
@@ -186,7 +335,7 @@ class MongoDBLazyJsonBackend(LazyJsonBackend):
     _snapshot_session = None
 
     @contextlib.contextmanager
-    def transaction_context(self):
+    def transaction_context(self) -> "Iterator[MongoDBLazyJsonBackend]":
         try:
             if self.__class__._session is None:
                 client = get_graph_data_mongodb_client()
@@ -201,7 +350,7 @@ class MongoDBLazyJsonBackend(LazyJsonBackend):
             self.__class__._session = None
 
     @contextlib.contextmanager
-    def snapshot_context(self):
+    def snapshot_context(self) -> "Iterator[MongoDBLazyJsonBackend]":
         try:
             if self.__class__._snapshot_session is None:
                 client = get_graph_data_mongodb_client()
@@ -312,6 +461,7 @@ class MongoDBLazyJsonBackend(LazyJsonBackend):
 LAZY_JSON_BACKENDS = {
     "file": FileLazyJsonBackend,
     "mongodb": MongoDBLazyJsonBackend,
+    "github": GithubLazyJsonBackend,
 }
 
 
@@ -321,6 +471,7 @@ def sync_lazy_json_hashmap(
     destination_backends,
     n_per_batch=5000,
     writer=print,
+    keys_to_sync=None,
 ):
     primary_backend = LAZY_JSON_BACKENDS[source_backend]()
     primary_hashes = primary_backend.hgetall(hashmap, hashval=True)
@@ -341,6 +492,8 @@ def sync_lazy_json_hashmap(
 
         curr_nodes = set(backend_hashes[backend_name].keys())
         del_nodes = curr_nodes - primary_nodes
+        if keys_to_sync is not None:
+            del_nodes &= keys_to_sync
         if del_nodes:
             backend.hdel(hashmap, list(del_nodes))
             writer(
@@ -353,6 +506,9 @@ def sync_lazy_json_hashmap(
                 backend_hashes[backend_name][node] != primary_hashes[node]
             ):
                 all_nodes_to_get.add(node)
+
+    if keys_to_sync is not None:
+        all_nodes_to_get &= keys_to_sync
 
     writer(
         "    OUT OF SYNC %s:%s nodes (%d)"
@@ -399,7 +555,7 @@ def sync_lazy_json_hashmap(
                 )
 
 
-def sync_lazy_json_across_backends(batch_size=5000):
+def sync_lazy_json_across_backends(batch_size=5000, keys_to_sync=None):
     """Sync data from the primary backend to the secondary ones.
 
     If there is only one backend, this is a no-op.
@@ -428,6 +584,7 @@ def sync_lazy_json_across_backends(batch_size=5000):
                 CF_TICK_GRAPH_DATA_PRIMARY_BACKEND,
                 CF_TICK_GRAPH_DATA_BACKENDS[1:],
                 writer=_write_and_flush,
+                keys_to_sync=keys_to_sync,
             )
 
         # if mongodb has better performance we do this
@@ -494,14 +651,23 @@ def lazy_json_snapshot():
 
 
 @contextlib.contextmanager
-def lazy_json_override_backends(new_backends, hashmaps_to_sync=None):
+def lazy_json_override_backends(
+    new_backends,
+    hashmaps_to_sync=None,
+    use_file_cache=None,
+    keys_to_sync=None,
+):
     global CF_TICK_GRAPH_DATA_BACKENDS
     global CF_TICK_GRAPH_DATA_PRIMARY_BACKEND
+    global CF_TICK_GRAPH_DATA_USE_FILE_CACHE
 
+    old_cache = CF_TICK_GRAPH_DATA_USE_FILE_CACHE
     old_backends = CF_TICK_GRAPH_DATA_BACKENDS
     try:
         CF_TICK_GRAPH_DATA_BACKENDS = tuple(new_backends)
         CF_TICK_GRAPH_DATA_PRIMARY_BACKEND = new_backends[0]
+        if use_file_cache is not None:
+            CF_TICK_GRAPH_DATA_USE_FILE_CACHE = use_file_cache
         yield
     finally:
         if hashmaps_to_sync is not None:
@@ -516,10 +682,12 @@ def lazy_json_override_backends(new_backends, hashmaps_to_sync=None):
                         hashmap,
                         new_backends[0],
                         sync_backends,
+                        keys_to_sync=keys_to_sync,
                     )
 
         CF_TICK_GRAPH_DATA_BACKENDS = old_backends
         CF_TICK_GRAPH_DATA_PRIMARY_BACKEND = old_backends[0]
+        CF_TICK_GRAPH_DATA_USE_FILE_CACHE = old_cache
 
 
 def get_lazy_json_backends():
@@ -588,7 +756,9 @@ class LazyJson(MutableMapping):
 
             # check if we have it in the cache first
             # if yes, load it from cache, if not load from primary backend and cache it
-            if file_backend.hexists(self.hashmap, self.node):
+            if CF_TICK_GRAPH_DATA_USE_FILE_CACHE and file_backend.hexists(
+                self.hashmap, self.node
+            ):
                 data_str = file_backend.hget(self.hashmap, self.node)
             else:
                 backend = LAZY_JSON_BACKENDS[CF_TICK_GRAPH_DATA_PRIMARY_BACKEND]()
@@ -598,7 +768,10 @@ class LazyJson(MutableMapping):
                     data_str = data_str.decode("utf-8")
 
                 # cache it locally for later
-                if CF_TICK_GRAPH_DATA_PRIMARY_BACKEND != "file":
+                if (
+                    CF_TICK_GRAPH_DATA_USE_FILE_CACHE
+                    and CF_TICK_GRAPH_DATA_PRIMARY_BACKEND != "file"
+                ):
                     file_backend.hset(self.hashmap, self.node, data_str)
 
             self._data_hash_at_load = hashlib.sha256(
@@ -614,18 +787,19 @@ class LazyJson(MutableMapping):
             self._data_hash_at_load = curr_hash
 
             # cache it locally
-            file_backend = LAZY_JSON_BACKENDS["file"]()
-            file_backend.hset(self.hashmap, self.node, data_str)
+            if CF_TICK_GRAPH_DATA_USE_FILE_CACHE:
+                file_backend = LAZY_JSON_BACKENDS["file"]()
+                file_backend.hset(self.hashmap, self.node, data_str)
 
             # sync changes to all backends
             for backend_name in CF_TICK_GRAPH_DATA_BACKENDS:
-                if backend_name == "file":
+                if backend_name == "file" and CF_TICK_GRAPH_DATA_USE_FILE_CACHE:
                     continue
                 backend = LAZY_JSON_BACKENDS[backend_name]()
                 backend.hset(self.hashmap, self.node, data_str)
 
         if purge:
-            # this evicts the josn from memory and trades i/o for mem
+            # this evicts the json from memory and trades i/o for mem
             # the bot uses too much mem if we don't do this
             self._data = None
             self._data_hash_at_load = None
@@ -662,6 +836,12 @@ def default(obj: Any) -> Any:
         return {"__lazy_json__": obj.file_name}
     elif isinstance(obj, Set):
         return {"__set__": True, "elements": sorted(obj)}
+    elif isinstance(obj, nx.DiGraph):
+        nld = nx.node_link_data(obj)
+        links = nld["links"]
+        links2 = sorted(links, key=lambda x: f'{x["source"]}{x["target"]}')
+        nld["links"] = links2
+        return {"__nx_digraph__": True, "node_link_data": nld}
     raise TypeError(repr(obj) + " is not JSON serializable")
 
 
@@ -671,6 +851,8 @@ def object_hook(dct: dict) -> Union[LazyJson, Set, dict]:
         return LazyJson(dct["__lazy_json__"])
     elif "__set__" in dct:
         return set(dct["elements"])
+    elif "__nx_digraph__" in dct:
+        return nx.node_link_graph(dct["node_link_data"])
     return dct
 
 
@@ -728,29 +910,15 @@ def load(
     return json.load(fp, object_hook=object_hook, **kwargs)
 
 
-def main_sync(args):
-    from conda_forge_tick.utils import setup_logger
-
-    if args.debug:
-        setup_logger(logging.getLogger("conda_forge_tick"), level="debug")
-    else:
-        setup_logger(logging.getLogger("conda_forge_tick"))
-
-    if not args.dry_run:
+def main_sync(ctx: CliContext):
+    if not ctx.dry_run:
         sync_lazy_json_across_backends()
 
 
-def main_cache(args):
-    from conda_forge_tick.utils import setup_logger
-
+def main_cache(ctx: CliContext):
     global CF_TICK_GRAPH_DATA_BACKENDS
 
-    if args.debug:
-        setup_logger(logging.getLogger("conda_forge_tick"), level="debug")
-    else:
-        setup_logger(logging.getLogger("conda_forge_tick"))
-
-    if not args.dry_run and len(CF_TICK_GRAPH_DATA_BACKENDS) > 1:
+    if not ctx.dry_run and len(CF_TICK_GRAPH_DATA_BACKENDS) > 1:
         OLD_CF_TICK_GRAPH_DATA_BACKENDS = CF_TICK_GRAPH_DATA_BACKENDS
         try:
             CF_TICK_GRAPH_DATA_BACKENDS = (

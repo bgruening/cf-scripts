@@ -1,18 +1,17 @@
 import os
 import typing
 from typing import Any
+
 from ruamel.yaml import YAML
 
-from conda_forge_tick.os_utils import pushd
 from conda_forge_tick.migrators.core import MiniMigrator
+from conda_forge_tick.os_utils import pushd
 
 if typing.TYPE_CHECKING:
     from ..migrators_types import AttrsTypedDict
 
 
 class CondaForgeYAMLCleanup(MiniMigrator):
-    # if you add a key here, you need to add it to the set of
-    # keys kept in the graph in make_graph.py
     keys_to_remove = [
         "min_r_ver",
         "max_r_ver",
@@ -20,11 +19,15 @@ class CondaForgeYAMLCleanup(MiniMigrator):
         "max_py_ver",
         "compiler_stack",
     ]
+    keys_to_change = [
+        "test_on_native_only",
+        "abi_migration_branches",
+    ]
 
     def filter(self, attrs: "AttrsTypedDict", not_bad_str_start: str = "") -> bool:
-        """only remove the keys if they are there"""
+        """remove recipes without a conda-forge.yml file that has the keys to remove or change"""
         cfy = attrs.get("conda-forge.yml", {})
-        if any(k in cfy for k in self.keys_to_remove):
+        if any(key in cfy for key in (self.keys_to_remove + self.keys_to_change)):
             return False
         else:
             return True
@@ -41,6 +44,17 @@ class CondaForgeYAMLCleanup(MiniMigrator):
             for k in self.keys_to_remove:
                 if k in cfg:
                     del cfg[k]
+
+            if "test_on_native_only" in cfg:
+                value = cfg["test_on_native_only"]
+                del cfg["test_on_native_only"]
+                if value:
+                    cfg["test"] = "native_and_emulated"
+
+            if "abi_migration_branches" in cfg:
+                cfg["abi_migration_branches"] = [
+                    str(v) for v in cfg["abi_migration_branches"]
+                ]
 
             with open(cfg_path, "w") as fp:
                 yaml.dump(cfg, fp)

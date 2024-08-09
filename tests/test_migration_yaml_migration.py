@@ -1,24 +1,20 @@
+import logging
 import os
 import re
-import logging
 from unittest import mock
 
-import pytest
 import networkx as nx
+import pytest
 
-from conda_forge_tick.contexts import MigratorSessionContext, MigratorContext
-from conda_forge_tick.utils import (
-    parse_meta_yaml,
-    frozen_to_json_friendly,
-)
 from conda_forge_tick.feedstock_parser import populate_feedstock_attributes
 from conda_forge_tick.migrators import MigrationYamlCreator, merge_migrator_cbc
-from conda_forge_tick.os_utils import pushd, eval_cmd
+from conda_forge_tick.os_utils import eval_cmd, pushd
+from conda_forge_tick.utils import frozen_to_json_friendly, parse_meta_yaml
 
 G = nx.DiGraph()
 G.add_node("conda", reqs=["python"], payload={})
 G.graph["outputs_lut"] = {}
-os.environ["CIRCLE_BUILD_URL"] = "hi world"
+os.environ["RUN_URL"] = "hi world"
 
 YAML_PATH = os.path.join(os.path.dirname(__file__), "test_yaml")
 
@@ -112,10 +108,12 @@ build:
 BOOST_YAML = """\
 __migrator:
   build_number: 1
-  commit_message: Rebuild for boost 1.99
+  commit_message: Rebuild for libboost_devel 1.99
   kind: version
   migration_number: 1
-boost:
+libboost_devel:
+- '1.99'
+libboost_python_devel:
 - '1.99'
 migrator_ts: 12345.2
 """
@@ -132,15 +130,24 @@ def test_migration_yaml_migration(tmock, in_out_yaml, caplog, tmpdir):
         logger="conda_forge_tick.migrators.migration_yaml",
     )
     tmock.return_value = 12345.2
-    pname = "boost"
+    pname = "libboost_devel"
     pin_ver = "1.99.0"
     curr_pin = "1.70.0"
     pin_spec = "x.x"
 
-    MYM = MigrationYamlCreator(pname, pin_ver, curr_pin, pin_spec, "hi", G, G)
+    MYM = MigrationYamlCreator(
+        pname,
+        pin_ver,
+        curr_pin,
+        pin_spec,
+        "hi",
+        G,
+        G,
+        pinnings=["libboost_devel", "libboost_python_devel"],
+    )
 
     with pushd(tmpdir):
-        eval_cmd("git init .")
+        eval_cmd(["git", "init", "."])
 
     os.makedirs(os.path.join(tmpdir, "migrations"), exist_ok=True)
 
@@ -159,7 +166,7 @@ def test_migration_yaml_migration(tmock, in_out_yaml, caplog, tmpdir):
         tmpdir=tmpdir,
     )
 
-    boost_file = os.path.join(tmpdir, "migrations", "boost199.yaml")
+    boost_file = os.path.join(tmpdir, "migrations", "libboost_devel199.yaml")
     assert os.path.exists(boost_file)
     with open(boost_file) as fp:
         bf_out = fp.read()
@@ -176,17 +183,6 @@ def run_test_migration(
     should_filter=False,
     tmpdir=None,
 ):
-    mm_ctx = MigratorSessionContext(
-        graph=G,
-        smithy_version="",
-        pinning_version="",
-        github_username="",
-        github_password="",
-        circle_build_url=os.environ["CIRCLE_BUILD_URL"],
-    )
-    m_ctx = MigratorContext(mm_ctx, m)
-    m.bind_to_ctx(m_ctx)
-
     if mr_out:
         mr_out.update(bot_rerun=False)
     with open(os.path.join(tmpdir, "meta.yaml"), "w") as f:
@@ -205,7 +201,7 @@ def run_test_migration(
     except Exception:
         name = "blah"
 
-    pmy = populate_feedstock_attributes(name, {}, inp, cf_yml)
+    pmy = populate_feedstock_attributes(name, {}, inp, None, cf_yml)
 
     # these are here for legacy migrators
     pmy["version"] = pmy["meta_yaml"]["package"]["version"]

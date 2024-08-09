@@ -3,16 +3,21 @@ from contextlib import contextmanager
 
 
 class SensitiveEnv:
-    SENSITIVE_KEYS = ["USERNAME", "PASSWORD", "GITHUB_TOKEN", "GH_TOKEN"]
+    SENSITIVE_KEYS = [
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "BOT_TOKEN",
+        "MONGODB_CONNECTION_STRING",
+    ]
 
     def __init__(self):
-        self.clasified_info = {}
+        self.classified_info = {}
 
     def hide_env_vars(self):
         """Remove sensitive env vars"""
-        self.clasified_info.update(
+        self.classified_info.update(
             {
-                k: os.environ.pop(k, self.clasified_info.get(k, None))
+                k: os.environ.pop(k, self.classified_info.get(k, None))
                 for k in self.SENSITIVE_KEYS
             },
         )
@@ -20,7 +25,7 @@ class SensitiveEnv:
     def reveal_env_vars(self):
         """Restore sensitive env vars"""
         os.environ.update(
-            **{k: v for k, v in self.clasified_info.items() if v is not None}
+            **{k: v for k, v in self.classified_info.items() if v is not None}
         )
 
     @contextmanager

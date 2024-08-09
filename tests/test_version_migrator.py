@@ -1,16 +1,22 @@
+import logging
 import os
 import random
-import logging
+from pathlib import Path
+
 import pytest
 from flaky import flaky
+from test_migrators import run_test_migration
 
 from conda_forge_tick.migrators import Version
-
-from test_migrators import run_test_migration
+from conda_forge_tick.migrators.version import VersionMigrationError
 
 VERSION = Version(set())
 
 YAML_PATH = os.path.join(os.path.dirname(__file__), "test_yaml")
+
+VARIANT_SOURCES_NOT_IMPLEMENTED = (
+    "Sources that depend on conda build config variants are not supported yet."
+)
 
 
 @pytest.mark.parametrize(
@@ -49,6 +55,22 @@ YAML_PATH = os.path.join(os.path.dirname(__file__), "test_yaml")
         ("libevent", "2.1.12"),
         ("boost", "1.74.0"),
         ("boostcpp", "1.74.0"),
+        # these contain sources that depend on conda build config variants
+        pytest.param(
+            "polars_mixed_selectors",
+            "1.1.0",
+            marks=pytest.mark.xfail(reason=VARIANT_SOURCES_NOT_IMPLEMENTED),
+        ),
+        pytest.param(
+            "polars_name_selectors",
+            "1.1.0",
+            marks=pytest.mark.xfail(reason=VARIANT_SOURCES_NOT_IMPLEMENTED),
+        ),
+        pytest.param(
+            "polars_variant_selectors",
+            "1.1.0",
+            marks=pytest.mark.xfail(reason=VARIANT_SOURCES_NOT_IMPLEMENTED),
+        ),
         # upstream is not available
         # ("mumps", "5.2.1"),
         # ("cb3multi", "6.0.0"),
@@ -78,7 +100,7 @@ def test_version_up(case, new_ver, tmpdir, caplog):
         kwargs=kwargs,
         prb="Dependencies have been updated if changed",
         mr_out={
-            "migrator_name": "Version",
+            "migrator_name": Version.name,
             "migrator_version": Version.migrator_version,
             "version": new_ver,
         },
@@ -108,23 +130,20 @@ def test_version_noup(case, new_ver, tmpdir, caplog):
     with open(os.path.join(YAML_PATH, "version_%s_correct.yaml" % case)) as fp:
         out_yaml = fp.read()
 
-    attrs = run_test_migration(
-        m=VERSION,
-        inp=in_yaml,
-        output=out_yaml,
-        kwargs={"new_version": new_ver},
-        prb="Dependencies have been updated if changed",
-        mr_out={},
-        tmpdir=tmpdir,
-    )
+    with pytest.raises(VersionMigrationError) as e:
+        run_test_migration(
+            m=VERSION,
+            inp=in_yaml,
+            output=out_yaml,
+            kwargs={"new_version": new_ver},
+            prb="Dependencies have been updated if changed",
+            mr_out={},
+            tmpdir=tmpdir,
+        )
 
-    print(
-        "\n\n"
-        + attrs.get("version_pr_info", {})
-        .get("new_version_errors", {})
-        .get(new_ver, "")
-        + "\n\n",
-    )
+    assert "The recipe did not change in the version migration," in str(
+        e.value
+    ), e.value
 
 
 def test_version_cupy(tmpdir, caplog):
@@ -135,15 +154,10 @@ def test_version_cupy(tmpdir, caplog):
         logger="conda_forge_tick.migrators.version",
     )
 
-    with open(os.path.join(YAML_PATH, "version_%s.yaml" % case)) as fp:
-        in_yaml = fp.read()
-
-    with open(os.path.join(YAML_PATH, "version_%s_correct.yaml" % case)) as fp:
-        out_yaml = fp.read()
+    in_yaml = Path(YAML_PATH).joinpath(f"version_{case}.yaml").read_text()
+    out_yaml = Path(YAML_PATH).joinpath(f"version_{case}_correct.yaml").read_text()
 
     kwargs = {"new_version": new_ver}
-    if case == "sha1":
-        kwargs["hash_type"] = "sha1"
 
     run_test_migration(
         m=VERSION,
@@ -152,7 +166,7 @@ def test_version_cupy(tmpdir, caplog):
         kwargs=kwargs,
         prb="Dependencies have been updated if changed",
         mr_out={
-            "migrator_name": "Version",
+            "migrator_name": Version.name,
             "migrator_version": Version.migrator_version,
             "version": new_ver,
         },
@@ -189,7 +203,7 @@ def test_version_rand_frac(tmpdir, caplog):
         kwargs=kwargs,
         prb="Dependencies have been updated if changed",
         mr_out={
-            "migrator_name": "Version",
+            "migrator_name": Version.name,
             "migrator_version": Version.migrator_version,
             "version": new_ver,
         },

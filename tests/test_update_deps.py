@@ -1,27 +1,24 @@
-import os
-from pathlib import Path
-import tempfile
 import logging
-
-from flaky import flaky
-
-from conda_forge_tick.lazy_json_backends import load
-from conda_forge_tick.recipe_parser import CondaMetaYAML
-from conda_forge_tick.update_deps import (
-    get_depfinder_comparison,
-    get_grayskull_comparison,
-    generate_dep_hint,
-    make_grayskull_recipe,
-    _update_sec_deps,
-    _merge_dep_comparisons_sec,
-    get_dep_updates_and_hints,
-)
-from conda_forge_tick.migrators import Version, DependencyUpdateMigrator
+import os
+import tempfile
+from pathlib import Path
 
 import pytest
-
+from flaky import flaky
 from test_migrators import run_test_migration
 
+from conda_forge_tick.lazy_json_backends import load
+from conda_forge_tick.migrators import DependencyUpdateMigrator, Version
+from conda_forge_tick.recipe_parser import CondaMetaYAML
+from conda_forge_tick.update_deps import (
+    _merge_dep_comparisons_sec,
+    _update_sec_deps,
+    generate_dep_hint,
+    get_dep_updates_and_hints,
+    get_depfinder_comparison,
+    get_grayskull_comparison,
+    make_grayskull_recipe,
+)
 
 VERSION = Version(
     set(),
@@ -128,7 +125,7 @@ def test_update_run_deps():
         os.path.join(os.path.dirname(__file__), "test_yaml", "depfinder.json"),
     ) as f:
         attrs = load(f)
-    d, rs = get_grayskull_comparison(attrs)
+    d, _ = get_grayskull_comparison(attrs)
     lines = attrs["raw_meta_yaml"].splitlines()
     lines = [ln + "\n" for ln in lines]
     recipe = CondaMetaYAML("".join(lines))
@@ -143,7 +140,7 @@ def test_update_run_deps():
     updated_deps = _update_sec_deps(recipe, d, ["host", "run"], update_python=True)
     print("\n" + recipe.dumps())
     assert updated_deps
-    assert "python >=3.6" in recipe.dumps()
+    assert "python >=3.7" in recipe.dumps()
 
 
 @flaky
@@ -233,7 +230,6 @@ def test_get_dep_updates_and_hints_praw():
         "new_version": "7.7.0",
     }
     with tempfile.TemporaryDirectory() as tmpdir:
-
         recipe = Path(tmpdir) / "meta.yaml"
         recipe.write_text(praw_recipe)
 
@@ -247,6 +243,16 @@ def test_get_dep_updates_and_hints_praw():
 
     print(res[0], res[1], flush=True)
     assert "websocket" in res[1]
+
+
+@pytest.mark.parametrize("disabled_param", ["disabled"])
+def test_get_dep_updates_and_hints_disabled(disabled_param):
+    dep_comparison, hints = get_dep_updates_and_hints(
+        disabled_param, "RECIPE_DIR", {"no": "attrs"}, {"no_nodes"}, "VERSION_KEY"
+    )
+
+    assert dep_comparison == {}
+    assert hints == ""
 
 
 out_yml_gs = """\
@@ -439,7 +445,7 @@ def test_update_deps_version(caplog, tmpdir, update_kind, out_yml):
         kwargs=kwargs,
         prb="Dependencies have been updated if changed",
         mr_out={
-            "migrator_name": "Version",
+            "migrator_name": Version.name,
             "migrator_version": Version.migrator_version,
             "version": new_ver,
         },
@@ -606,7 +612,7 @@ def test_update_deps_version_pyquil(caplog, tmpdir, update_kind, out_yml):
         kwargs=kwargs,
         prb="Dependencies have been updated if changed",
         mr_out={
-            "migrator_name": "Version",
+            "migrator_name": Version.name,
             "migrator_version": Version.migrator_version,
             "version": new_ver,
         },

@@ -1,9 +1,10 @@
+import copy
 import os
 import typing
 from typing import Any
-import copy
 
-from conda_forge_tick.migrators.core import Replacement, _parse_bad_attr
+from conda_forge_tick.migrators.core import _parse_bad_attr
+from conda_forge_tick.migrators.replacement import Replacement
 from conda_forge_tick.utils import frozen_to_json_friendly
 
 if typing.TYPE_CHECKING:
@@ -53,7 +54,6 @@ class MatplotlibBase(Replacement):
     def migrate(
         self, recipe_dir: str, attrs: "AttrsTypedDict", **kwargs: Any
     ) -> "MigrationUidTypedDict":
-
         yum_pth = os.path.join(recipe_dir, "yum_requirements.txt")
         if not os.path.exists(yum_pth):
             yum_lines = []
