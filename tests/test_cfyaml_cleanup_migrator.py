@@ -1,13 +1,10 @@
 import os
+
 import pytest
 from ruamel.yaml import YAML
-
-from conda_forge_tick.migrators import (
-    Version,
-    CondaForgeYAMLCleanup,
-)
-
 from test_migrators import run_test_migration
+
+from conda_forge_tick.migrators import CondaForgeYAMLCleanup, Version
 
 VERSION_CF = Version(
     set(),
@@ -58,7 +55,7 @@ def test_version_cfyaml_cleanup(cases, tmpdir):
         kwargs={"new_version": "0.9"},
         prb="Dependencies have been updated if changed",
         mr_out={
-            "migrator_name": "Version",
+            "migrator_name": Version.name,
             "migrator_version": Version.migrator_version,
             "version": "0.9",
         },

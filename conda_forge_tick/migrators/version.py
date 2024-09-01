@@ -1,30 +1,28 @@
-import os
-import typing
+import copy
 import functools
-import random
-from typing import (
-    Sequence,
-    Any,
-    List,
-)
-import warnings
 import logging
+import os
+import random
+import typing
+import warnings
+from typing import Any, List, Sequence
 
-import networkx as nx
 import conda.exceptions
+import networkx as nx
 from conda.models.version import VersionOrder
 
+from conda_forge_tick.contexts import ClonedFeedstockContext, FeedstockContext
 from conda_forge_tick.migrators.core import Migrator
-from conda_forge_tick.contexts import FeedstockContext
+from conda_forge_tick.models.pr_info import MigratorName
 from conda_forge_tick.os_utils import pushd
-from conda_forge_tick.utils import sanitize_string
 from conda_forge_tick.update_deps import get_dep_updates_and_hints
 from conda_forge_tick.update_recipe import update_version
+from conda_forge_tick.utils import get_keys_default, sanitize_string
 
 if typing.TYPE_CHECKING:
     from conda_forge_tick.migrators_types import (
-        MigrationUidTypedDict,
         AttrsTypedDict,
+        MigrationUidTypedDict,
         PackageName,
     )
 
@@ -32,7 +30,11 @@ SKIP_DEPS_NODES = [
     "ansible",
 ]
 
-logger = logging.getLogger("conda_forge_tick.migrators.version")
+logger = logging.getLogger(__name__)
+
+
+class VersionMigrationError(Exception):
+    pass
 
 
 def _fmt_error_message(errors, version):
@@ -56,14 +58,22 @@ class Version(Migrator):
     max_num_prs = 3
     migrator_version = 0
     rerender = True
-    name = "Version"
+    name = MigratorName.VERSION
 
     def __init__(self, python_nodes, *args, **kwargs):
+        if not hasattr(self, "_init_args"):
+            self._init_args = [python_nodes, *args]
+
+        if not hasattr(self, "_init_kwargs"):
+            self._init_kwargs = copy.deepcopy(kwargs)
+
         self.python_nodes = python_nodes
         if "check_solvable" in kwargs:
             kwargs.pop("check_solvable")
         super().__init__(*args, **kwargs, check_solvable=False)
         self._new_version = None
+
+        self._reset_effective_graph()
 
     def filter(
         self,
@@ -91,7 +101,7 @@ class Version(Migrator):
                 [
                     k
                     for k in attrs.get("pr_info", {}).get("PRed", [])
-                    if k["data"].get("migrator_name") == "Version"
+                    if k["data"].get("migrator_name") == Version.name
                     # The PR is the actual PR itself
                     and k.get("PR", {}).get("state", None) == "open"
                 ],
@@ -124,11 +134,11 @@ class Version(Migrator):
             version_filter = True
 
         skip_filter = False
-        random_fraction_to_keep = (
-            attrs.get("conda-forge.yml", {})
-            .get("bot", {})
-            .get("version_updates", {})
-            .get("random_fraction_to_keep", None)
+        random_fraction_to_keep = get_keys_default(
+            attrs,
+            ["conda-forge.yml", "bot", "version_updates", "random_fraction_to_keep"],
+            {},
+            None,
         )
         logger.debug("random_fraction_to_keep: %r", random_fraction_to_keep)
         if random_fraction_to_keep is not None:
@@ -154,11 +164,11 @@ class Version(Migrator):
                 random.setstate(curr_state)
 
         ignore_filter = False
-        versions_to_ignore = (
-            attrs.get("conda-forge.yml", {})
-            .get("bot", {})
-            .get("version_updates", {})
-            .get("exclude", [])
+        versions_to_ignore = get_keys_default(
+            attrs,
+            ["conda-forge.yml", "bot", "version_updates", "exclude"],
+            {},
+            [],
         )
         if (
             str(new_version).replace("-", ".") in versions_to_ignore
@@ -166,8 +176,15 @@ class Version(Migrator):
         ):
             ignore_filter = True
 
+        skip_me = get_keys_default(
+            attrs,
+            ["conda-forge.yml", "bot", "version_updates", "skip"],
+            {},
+            False,
+        )
+
         self._new_version = None
-        return result or version_filter or skip_filter or ignore_filter
+        return result or version_filter or skip_filter or ignore_filter or skip_me
 
     def migrate(
         self,
@@ -176,17 +193,7 @@ class Version(Migrator):
         hash_type: str = "sha256",
         **kwargs: Any,
     ) -> "MigrationUidTypedDict":
-        version = attrs.get("version_pr_info", {})["new_version"]
-
-        # record the attempt
-        with attrs["version_pr_info"] as vpri:
-            if "new_version_attempts" not in vpri:
-                vpri["new_version_attempts"] = {}
-            if "new_version_errors" not in vpri:
-                vpri["new_version_errors"] = {}
-            if version not in vpri["new_version_attempts"]:
-                vpri["new_version_attempts"][version] = 0
-            vpri["new_version_attempts"][version] += 1
+        version = attrs["new_version"]
 
         with open(os.path.join(recipe_dir, "meta.yaml")) as fp:
             raw_meta_yaml = fp.read()
@@ -205,25 +212,30 @@ class Version(Migrator):
 
             return super().migrate(recipe_dir, attrs)
         else:
-            with attrs["version_pr_info"] as vpri:
-                vpri["new_version_errors"][version] = _fmt_error_message(
+            raise VersionMigrationError(
+                _fmt_error_message(
                     errors,
                     version,
                 )
-            return {}
+            )
 
-    def pr_body(self, feedstock_ctx: FeedstockContext) -> str:
-        pred = [
-            (
-                name,
-                self.ctx.effective_graph.nodes[name]["payload"]["version_pr_info"][
-                    "new_version"
-                ],
-            )
-            for name in list(
-                self.ctx.effective_graph.predecessors(feedstock_ctx.package_name),
-            )
-        ]
+    def pr_body(
+        self, feedstock_ctx: ClonedFeedstockContext, add_label_text: bool = False
+    ) -> str:
+        if feedstock_ctx.feedstock_name in self.effective_graph.nodes:
+            pred = [
+                (
+                    name,
+                    self.effective_graph.nodes[name]["payload"]["version_pr_info"][
+                        "new_version"
+                    ],
+                )
+                for name in list(
+                    self.effective_graph.predecessors(feedstock_ctx.feedstock_name),
+                )
+            ]
+        else:
+            pred = []
         body = ""
 
         # TODO: note that the closing logic needs to be modified when we
@@ -231,7 +243,7 @@ class Version(Migrator):
         open_version_prs = [
             muid["PR"]
             for muid in feedstock_ctx.attrs.get("pr_info", {}).get("PRed", [])
-            if muid["data"].get("migrator_name") == "Version"
+            if muid["data"].get("migrator_name") == Version.name
             # The PR is the actual PR itself
             and muid.get("PR", {}).get("state", None) == "open"
         ]
@@ -247,7 +259,6 @@ class Version(Migrator):
         else:
             upstream_url_link = ""
 
-        muid: dict
         body += (
             "It is very likely that the current package version for this "
             "feedstock is out of date.\n"
@@ -310,63 +321,67 @@ class Version(Migrator):
 
         return super().pr_body(feedstock_ctx, add_label_text=False).format(body)
 
-    def _hint_and_maybe_update_deps(self, feedstock_ctx):
-        update_deps = (
-            feedstock_ctx.attrs.get("conda-forge.yml", {})
-            .get("bot", {})
-            .get("inspection", "hint")
+    def _hint_and_maybe_update_deps(self, feedstock_ctx: ClonedFeedstockContext):
+        update_deps = get_keys_default(
+            feedstock_ctx.attrs,
+            ["conda-forge.yml", "bot", "inspection"],
+            {},
+            "disabled",
         )
         logger.info("bot.inspection: %s", update_deps)
-        if not update_deps:
-            return ""
-        else:
-            if feedstock_ctx.attrs["feedstock_name"] in SKIP_DEPS_NODES:
-                logger.info("Skipping dep update since node %s in rejectlist!")
-                hint = "\n\nDependency Analysis\n--------------------\n\n"
-                hint += (
-                    "We couldn't run dependency analysis since this feedstock is "
-                    "in the reject list for dep updates due to bot stability "
-                    "issues!"
-                )
-            else:
-                try:
-                    _, hint = get_dep_updates_and_hints(
-                        update_deps,
-                        os.path.join(feedstock_ctx.feedstock_dir, "recipe"),
-                        feedstock_ctx.attrs,
-                        self.python_nodes,
-                        "new_version",
-                    )
-                except (BaseException, Exception):
-                    hint = "\n\nDependency Analysis\n--------------------\n\n"
-                    hint += (
-                        "We couldn't run dependency analysis due to an internal "
-                        "error in the bot, depfinder, or grayskull. :/ "
-                        "Help is very welcome!"
-                    )
 
+        if feedstock_ctx.attrs["feedstock_name"] in SKIP_DEPS_NODES:
+            logger.info("Skipping dep update since node %s in rejectlist!")
+            hint = "\n\nDependency Analysis\n--------------------\n\n"
+            hint += (
+                "We couldn't run dependency analysis since this feedstock is "
+                "in the reject list for dep updates due to bot stability "
+                "issues!"
+            )
             return hint
+        try:
+            _, hint = get_dep_updates_and_hints(
+                update_deps,
+                str(feedstock_ctx.local_clone_dir / "recipe"),
+                feedstock_ctx.attrs,
+                self.python_nodes,
+                "new_version",
+            )
+        except BaseException as e:
+            logger.critical("Error doing bot dep inspection/updates!", exc_info=e)
+
+            hint = "\n\nDependency Analysis\n--------------------\n\n"
+            hint += (
+                "We couldn't run dependency analysis due to an internal "
+                "error in the bot, depfinder, or grayskull. :/ "
+                "Help is very welcome!"
+            )
+
+        return hint
 
     def commit_message(self, feedstock_ctx: FeedstockContext) -> str:
-        assert isinstance(feedstock_ctx.attrs["version_pr_info"]["new_version"], str)
-        return "updated v" + feedstock_ctx.attrs["version_pr_info"]["new_version"]
+        assert isinstance(feedstock_ctx.attrs["new_version"], str)
+        return "updated v" + feedstock_ctx.attrs["new_version"]
 
     def pr_title(self, feedstock_ctx: FeedstockContext) -> str:
-        assert isinstance(feedstock_ctx.attrs["version_pr_info"]["new_version"], str)
+        assert isinstance(feedstock_ctx.attrs["new_version"], str)
         # TODO: turn False to True when we default to automerge
-        if feedstock_ctx.attrs.get("conda-forge.yml", {}).get("bot", {}).get(
-            "automerge",
+        amerge = get_keys_default(
+            feedstock_ctx.attrs,
+            ["conda-forge.yml", "bot", "automerge"],
+            {},
             False,
-        ) in {"version", True}:
+        )
+        if amerge in {"version", True}:
             add_slug = "[bot-automerge] "
         else:
             add_slug = ""
 
         return (
             add_slug
-            + feedstock_ctx.package_name
+            + feedstock_ctx.feedstock_name
             + " v"
-            + feedstock_ctx.attrs["version_pr_info"]["new_version"]
+            + feedstock_ctx.attrs["new_version"]
         )
 
     def remote_branch(self, feedstock_ctx: FeedstockContext) -> str:
@@ -378,7 +393,7 @@ class Version(Migrator):
         if self._new_version is not None:
             new_version = self._new_version
         else:
-            new_version = attrs["version_pr_info"]["new_version"]
+            new_version = attrs["new_version"]
         n["version"] = new_version
         return n
 
@@ -397,38 +412,36 @@ class Version(Migrator):
         @functools.lru_cache(maxsize=1024)
         def _has_solver_checks(node):
             with graph.nodes[node]["payload"] as attrs:
-                return (
-                    attrs["conda-forge.yml"]
-                    .get("bot", {})
-                    .get(
-                        "check_solvable",
-                        False,
-                    )
+                return get_keys_default(
+                    attrs,
+                    ["conda-forge.yml", "bot", "check_solvable"],
+                    {},
+                    False,
                 )
 
         @functools.lru_cache(maxsize=1024)
-        def _get_attemps_nr(node):
+        def _get_attempts_nr(node):
             with graph.nodes[node]["payload"] as attrs:
                 with attrs["version_pr_info"] as vpri:
                     new_version = vpri.get("new_version", "")
                     attempts = vpri.get("new_version_attempts", {}).get(new_version, 0)
             return min(attempts, 3)
 
-        def _get_attemps_r(node, seen):
+        def _get_attempts_r(node, seen):
             seen |= {node}
-            attempts = _get_attemps_nr(node)
+            attempts = _get_attempts_nr(node)
             for d in nx.descendants(graph, node):
                 if d not in seen:
-                    attempts = max(attempts, _get_attemps_r(d, seen))
+                    attempts = max(attempts, _get_attempts_r(d, seen))
             return attempts
 
         @functools.lru_cache(maxsize=1024)
-        def _get_attemps(node):
+        def _get_attempts(node):
             if _has_solver_checks(node):
                 seen = set()
-                return _get_attemps_r(node, seen)
+                return _get_attempts_r(node, seen)
             else:
-                return _get_attemps_nr(node)
+                return _get_attempts_nr(node)
 
         def _desc_cmp(node1, node2):
             if _has_solver_checks(node1) and _has_solver_checks(node2):
@@ -446,7 +459,7 @@ class Version(Migrator):
         return sorted(
             sorted(
                 sorted(nodes_to_sort, key=lambda x: random.uniform(0, 1)),
-                key=_get_attemps,
+                key=_get_attempts,
             ),
             key=functools.cmp_to_key(_desc_cmp),
         )

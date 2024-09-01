@@ -1,12 +1,9 @@
 import os
+
 import pytest
-
-from conda_forge_tick.migrators import (
-    Version,
-    PipMigrator,
-)
-
 from test_migrators import run_test_migration
+
+from conda_forge_tick.migrators import PipMigrator, Version
 
 PC = PipMigrator()
 VERSION_PC = Version(set(), piggy_back_migrations=[PC])
@@ -31,7 +28,7 @@ def test_version_pipcheck(case, tmpdir):
         kwargs={"new_version": "0.9"},
         prb="Dependencies have been updated if changed",
         mr_out={
-            "migrator_name": "Version",
+            "migrator_name": Version.name,
             "migrator_version": Version.migrator_version,
             "version": "0.9",
         },

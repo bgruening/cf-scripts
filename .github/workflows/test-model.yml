@@ -1,0 +1,56 @@
+name: test-model
+
+on:
+  pull_request: null
+  workflow_dispatch:
+  schedule:
+    - cron: "10 8 * * *" # daily at 8:10 UTC
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PY_COLORS: "1"
+
+jobs:
+  test-model:
+    name: test-model
+    runs-on: "ubuntu-latest"
+    defaults:
+      run:
+        shell: bash -leo pipefail {0}
+
+    steps:
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4
+
+      - uses: mamba-org/setup-micromamba@f8b8a1e23a26f60a44c853292711bacfd3eac822 # v1
+        with:
+          environment-file: conda-lock.yml
+          environment-name: cf-scripts
+          condarc-file: autotick-bot/condarc
+
+      - name: configure conda, install code, and clone cf-graph
+        run: |
+          pip install --no-deps --no-build-isolation -e .
+          git clone --depth=1 https://github.com/regro/cf-graph-countyfair.git cf-graph
+
+      - name: conda info and env
+        run: |
+          echo "=================================================================="
+          echo "=================================================================="
+          conda info
+
+          echo ""
+          echo "=================================================================="
+          echo "=================================================================="
+          conda list
+
+      - name: run pytest (model)
+        run: |
+          cd cf-graph
+          # for pull requests, a failed model test should not be a failed check
+          # this is a hack around the absence of https://github.com/orgs/community/discussions/15452
+          pytest \
+            --durations 10 \
+            ../tests/model ${{ github.event_name == 'pull_request' && '|| [ $? = 1 ]' || '' }}

@@ -1,0 +1,10 @@
+#!/bin/bash
+
+# source profile scripts for conda
+source ~/.bash_profile
+
+# activate env
+conda activate cf-scripts
+
+# Run whatever the user wants.
+exec "$@"

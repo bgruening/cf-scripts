@@ -1,18 +1,16 @@
+from __future__ import annotations
+
 import os
-import copy
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
+
 from networkx import DiGraph
-import typing
-import threading
-import github3
+
 from conda_forge_tick.lazy_json_backends import load
-
-from typing import Union
-
-if typing.TYPE_CHECKING:
-    from conda_forge_tick.migrators import Migrator
-    from conda_forge_tick.migrators_types import AttrsTypedDict
-
+from conda_forge_tick.migrators_types import AttrsTypedDict
 
 if os.path.exists("all_feedstocks.json"):
     with open("all_feedstocks.json") as f:
@@ -22,101 +20,61 @@ else:
 
 
 @dataclass
-class GithubContext:
-    github_username: str
-    github_password: str
-    circle_build_url: str
-    github_token: typing.Optional[str] = ""
-    dry_run: bool = True
-    _tl: threading.local = threading.local()
-
-    @property
-    def gh(self) -> github3.GitHub:
-        if getattr(self._tl, "gh", None) is None:
-            if self.github_token:
-                gh = github3.login(token=self.github_token)
-            else:
-                gh = github3.login(self.github_username, self.github_password)
-            setattr(self._tl, "gh", gh)
-        return self._tl.gh
-
-    @property
-    def gh_api_requests_left(self) -> Union[int, None]:
-        """The remaining API requests left. Returns None if there is an exception"""
-        try:
-            left = self.gh.rate_limit()["resources"]["core"]["remaining"]
-        except Exception:
-            left = None
-
-        return left
-
-
-@dataclass
-class MigratorSessionContext(GithubContext):
-    """Singleton session context.  There should generally only be one of these"""
+class MigratorSessionContext:
+    """Singleton session context. There should generally only be one of these"""
 
     graph: DiGraph = None
     smithy_version: str = ""
     pinning_version: str = ""
-    prjson_dir = "pr_json"
-    rever_dir: str = "./feedstocks/"
-    quiet = True
+    dry_run: bool = True
 
 
-@dataclass
-class MigratorContext:
-    """The context for a given migrator.
-    This houses the runtime information that a migrator needs
+@dataclass(frozen=True)
+class FeedstockContext:
+    feedstock_name: str
+    attrs: AttrsTypedDict
+    default_branch: str = ""
+    """
+    If not provided, this is set to a default branch read from all_feedstocks.json, or 'main'.
     """
 
-    session: MigratorSessionContext
-    migrator: "Migrator"
-    _effective_graph: DiGraph = None
+    def __post_init__(self):
+        if not self.default_branch:
+            object.__setattr__(
+                self,
+                "default_branch",
+                DEFAULT_BRANCHES.get(self.feedstock_name, "main"),
+            )
 
     @property
-    def github_username(self) -> str:
-        return self.session.github_username
+    def git_repo_name(self) -> str:
+        return f"{self.feedstock_name}-feedstock"
 
-    @property
-    def effective_graph(self) -> DiGraph:
-        if self._effective_graph is None:
-            gx2 = copy.deepcopy(getattr(self.migrator, "graph", self.session.graph))
+    @contextmanager
+    def reserve_clone_directory(self) -> Iterator[ClonedFeedstockContext]:
+        """
+        Reserve a temporary directory for the feedstock repository that will be available within the context manager.
+        The returned context object will contain the path to the feedstock repository in local_clone_dir.
+        After the context manager exits, the temporary directory will be deleted.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_clone_dir = Path(tmpdir) / self.git_repo_name
+            local_clone_dir.mkdir()
 
-            # Prune graph to only things that need builds right now
-            for node in list(gx2.nodes):
-                if node not in self.session.graph.nodes:
-                    continue
-
-                with self.session.graph.nodes[node]["payload"] as _attrs:
-                    attrs = copy.deepcopy(_attrs.data)
-                base_branches = self.migrator.get_possible_feedstock_branches(attrs)
-                filters = []
-                for base_branch in base_branches:
-                    attrs["branch"] = base_branch
-                    filters.append(self.migrator.filter(attrs))
-
-                if filters and all(filters):
-                    gx2.remove_node(node)
-
-            self._effective_graph = gx2
-
-        return self._effective_graph
+            yield ClonedFeedstockContext(
+                **self.__dict__,
+                local_clone_dir=local_clone_dir,
+            )
 
 
-@dataclass
-class FeedstockContext:
-    package_name: str
-    feedstock_name: str
-    attrs: "AttrsTypedDict"
-    _default_branch: str = None
+@dataclass(frozen=True, kw_only=True)
+class ClonedFeedstockContext(FeedstockContext):
+    """
+    A FeedstockContext object that has reserved a temporary directory for the feedstock repository.
 
-    @property
-    def default_branch(self):
-        if self._default_branch is None:
-            return DEFAULT_BRANCHES.get(f"{self.feedstock_name}", "main")
-        else:
-            return self._default_branch
+    Implementation Note: Keep this class frozen or there will be consistency issues if someone modifies
+    a ClonedFeedstockContext object in place - it will not be reflected in the original FeedstockContext object.
 
-    @default_branch.setter
-    def default_branch(self, v):
-        self._default_branch = v
+    """
+
+    local_clone_dir: Path

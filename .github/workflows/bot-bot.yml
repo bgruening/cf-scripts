@@ -2,10 +2,10 @@ name: bot-bot
 
 on:
   workflow_dispatch: null
-  schedule:
-    - cron:  '*/15 * * * *'
+  # schedule:
+  #   - cron: '15 * * * *'
 
-concurrency: bot
+concurrency: bot-v2
 
 jobs:
   bot:
@@ -13,70 +13,59 @@ jobs:
     runs-on: "ubuntu-latest"
     defaults:
       run:
-        shell: bash -l {0}
+        shell: bash -leo pipefail {0}
 
     steps:
-      - uses: actions/checkout@v3
+      - name: get latest release
+        id: latest_release
+        run: |
+          tag_name=$(gh api repos/regro/cf-scripts/releases/latest --jq '.tag_name')
+          echo "latest release: ${tag_name}"
+          echo "tag_name=${tag_name}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4
         with:
+          ref: ${{ steps.latest_release.outputs.tag_name }}
           path: cf-scripts
 
-      - name: check filesystem
-        run: |
-          df
-
-      - name: check memory
-        run: |
-          free
-
-      - uses: mamba-org/setup-micromamba@v1
+      - uses: mamba-org/setup-micromamba@f8b8a1e23a26f60a44c853292711bacfd3eac822 # v1
         with:
-          environment-file: cf-scripts/environment.yml
-          create-args: "python==${{ vars.PYVER }}"
-          init-shell: bash
-          cache-environment: true
+          environment-file: cf-scripts/conda-lock.yml
           environment-name: cf-scripts
-          post-cleanup: 'all'
-          condarc: |
-            channels:
-              - conda-forge
-
-      # Update conda-forge-pinning as we might got an outdated versions through the environment caching.
-      - name: force-update conda-forge-pinning
-        run: |
-          micromamba update conda-forge-pinning
+          condarc-file: cf-scripts/autotick-bot/condarc
 
       - name: do local setup and stop me if needed
         run: |
           cd cf-scripts
           python autotick-bot/stop_me_if_needed.py
 
-
       - name: install bot code
         if: success() && ! env.CI_SKIP
         run: |
           source cf-scripts/autotick-bot/install_bot_code.sh
         env:
-          PASSWORD: ${{ secrets.AUTOTICK_BOT_TOKEN }}
+          BOT_TOKEN: ${{ secrets.AUTOTICK_BOT_TOKEN }}
 
       - name: run migrations
         if: success() && ! env.CI_SKIP
         timeout-minutes: 210
         run: |
-          export START_TIME=$(date +%s)
           export TIMEOUT=7200
-          export CIRCLE_BUILD_URL="https://github.com/regro/cf-scripts/actions/runs/${RUN_ID}"
-          export CIRCLE_BUILD_NUM="actually-actions-${RUN_ID}"
+          export RUN_URL="https://github.com/regro/cf-scripts/actions/runs/${RUN_ID}"
 
           pushd cf-graph
 
           conda-forge-tick auto-tick
         env:
-          USERNAME: regro-cf-autotick-bot
-          PASSWORD: ${{ secrets.AUTOTICK_BOT_TOKEN }}
+          BOT_TOKEN: ${{ secrets.AUTOTICK_BOT_TOKEN }}
           RUN_ID: ${{ github.run_id }}
           MEMORY_LIMIT_GB: 7
-          CF_TICK_GRAPH_DATA_BACKENDS: "mongodb:file"
+          CF_TICK_GRAPH_DATA_BACKENDS: "${{ vars.CF_TICK_GRAPH_DATA_BACKENDS }}"
           MONGODB_CONNECTION_STRING: ${{ secrets.MONGODB_CONNECTION_STRING }}
+          # emptied at the beginning and end of each run, used by Python tempdir
+          TMPDIR: ${{ runner.temp }}
 
       - name: status of changes
         if: github.ref == 'refs/heads/master' && always() && ! env.CI_SKIP
@@ -84,28 +73,16 @@ jobs:
           pushd cf-graph
           git status
 
-
       - name: deploy
         if: github.ref == 'refs/heads/master' && always() && ! env.CI_SKIP
         run: |
           pushd cf-graph
 
-          export CIRCLE_BUILD_URL="https://github.com/regro/cf-scripts/actions/runs/${RUN_ID}"
-          export CIRCLE_BUILD_NUM="actually-actions-${RUN_ID}"
+          export RUN_URL="https://github.com/regro/cf-scripts/actions/runs/${RUN_ID}"
           conda-forge-tick deploy-to-github
-
-
         env:
-          PASSWORD: ${{ secrets.AUTOTICK_BOT_TOKEN }}
+          BOT_TOKEN: ${{ secrets.AUTOTICK_BOT_TOKEN }}
           RUN_ID: ${{ github.run_id }}
-
-      - name: trigger next job
-        uses: benc-uk/workflow-dispatch@798e70c97009500150087d30d9f11c5444830385
-        if: github.ref == 'refs/heads/master' && ! cancelled() && ! failure() && ! env.CI_SKIP
-        with:
-          workflow: bot-bot
-          ref: ${{ github.event.ref }}
-          token: ${{ secrets.AUTOTICK_BOT_TOKEN }}
 
       - name: bump on fail
         if: github.ref == 'refs/heads/master' && failure() && ! env.CI_SKIP
@@ -113,6 +90,14 @@ jobs:
           export ACTION_URL="https://github.com/regro/cf-scripts/actions/runs/${RUN_ID}"
           python cf-scripts/autotick-bot/bump_bot_team.py
         env:
-          PASSWORD: ${{ secrets.AUTOTICK_BOT_TOKEN }}
+          BOT_TOKEN: ${{ secrets.AUTOTICK_BOT_TOKEN }}
           RUN_ID: ${{ github.run_id }}
           ACTION_NAME: ${{ github.workflow }}
+
+      - name: trigger next job
+        uses: benc-uk/workflow-dispatch@25b02cc069be46d637e8fe2f1e8484008e9e9609 # v1.2.3
+        if: github.ref == 'refs/heads/master' && ! cancelled() && ! failure() && ! env.CI_SKIP
+        with:
+          workflow: bot-bot
+          ref: ${{ github.event.ref }}
+          token: ${{ secrets.AUTOTICK_BOT_TOKEN }}

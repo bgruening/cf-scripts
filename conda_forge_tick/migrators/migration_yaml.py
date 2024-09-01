@@ -1,31 +1,32 @@
 import copy
-import os
-from itertools import chain
-import typing
-from typing import Optional, Set, Sequence, Any, MutableSet
-import time
-import re
-from collections import defaultdict
 import logging
+import os
 import random
+import re
+import time
+import typing
+from collections import defaultdict
+from typing import Any, List, MutableSet, Optional, Sequence, Set
 
 import networkx as nx
 
-from conda_forge_tick.contexts import FeedstockContext
-from conda_forge_tick.migrators.core import GraphMigrator, MiniMigrator, Migrator
-from conda_forge_tick.os_utils import pushd, eval_cmd
-from conda_forge_tick.utils import pluck, yaml_safe_load, yaml_safe_dump
-from conda_forge_tick.make_graph import get_deps_from_outputs_lut
+from conda_forge_tick.contexts import ClonedFeedstockContext, FeedstockContext
 from conda_forge_tick.feedstock_parser import PIN_SEP_PAT
+from conda_forge_tick.make_graph import get_deps_from_outputs_lut
+from conda_forge_tick.migrators.core import GraphMigrator, Migrator, MiniMigrator
+from conda_forge_tick.os_utils import pushd
+from conda_forge_tick.utils import (
+    get_bot_run_url,
+    get_keys_default,
+    pluck,
+    yaml_safe_dump,
+    yaml_safe_load,
+)
 
 if typing.TYPE_CHECKING:
-    from ..migrators_types import (
-        MigrationUidTypedDict,
-        AttrsTypedDict,
-        PackageName,
-    )
+    from ..migrators_types import AttrsTypedDict, MigrationUidTypedDict, PackageName
 
-logger = logging.getLogger("conda_forge_tick.migrators.migration_yaml")
+logger = logging.getLogger(__name__)
 
 
 def _patch_dict(cfg, patches):
@@ -107,6 +108,9 @@ def merge_migrator_cbc(migrator_yaml: str, conda_build_config_yaml: str):
         # if this is in a key we didn't migrate, add the line (or it is a space)
         elif current_cbc_key not in migrator_keys or line.isspace() or not line:
             outbound_cbc.append(line)
+    if outbound_cbc and outbound_cbc[-1]:
+        # ensure trailing newline
+        outbound_cbc.append("")
     return "\n".join(outbound_cbc)
 
 
@@ -121,8 +125,8 @@ class MigrationYaml(GraphMigrator):
     def __init__(
         self,
         yaml_contents: str,
+        name: str,
         graph: nx.DiGraph = None,
-        name: Optional[str] = None,
         pr_limit: int = 50,
         top_level: Set["PackageName"] = None,
         cycles: Optional[Sequence["PackageName"]] = None,
@@ -134,8 +138,36 @@ class MigrationYaml(GraphMigrator):
         conda_forge_yml_patches=None,
         ignored_deps_per_node=None,
         max_solver_attempts=3,
+        effective_graph: nx.DiGraph = None,
+        force_pr_after_solver_attempts=100,
+        longterm=False,
+        paused=False,
         **kwargs: Any,
     ):
+        if not hasattr(self, "_init_args"):
+            self._init_args = [yaml_contents, name]
+
+        if not hasattr(self, "_init_kwargs"):
+            self._init_kwargs = {
+                "graph": graph,
+                "pr_limit": pr_limit,
+                "top_level": top_level,
+                "cycles": cycles,
+                "migration_number": migration_number,
+                "bump_number": bump_number,
+                "piggy_back_migrations": piggy_back_migrations,
+                "automerge": automerge,
+                "check_solvable": check_solvable,
+                "conda_forge_yml_patches": conda_forge_yml_patches,
+                "ignored_deps_per_node": ignored_deps_per_node,
+                "max_solver_attempts": max_solver_attempts,
+                "effective_graph": effective_graph,
+                "longterm": longterm,
+                "force_pr_after_solver_attempts": force_pr_after_solver_attempts,
+                "paused": paused,
+            }
+            self._init_kwargs.update(copy.deepcopy(kwargs))
+
         super().__init__(
             graph=graph,
             pr_limit=pr_limit,
@@ -143,37 +175,23 @@ class MigrationYaml(GraphMigrator):
             piggy_back_migrations=piggy_back_migrations,
             check_solvable=check_solvable,
             ignored_deps_per_node=ignored_deps_per_node,
+            effective_graph=effective_graph,
         )
         self.yaml_contents = yaml_contents
         assert isinstance(name, str)
-        self.name: str = name
+        self.name = name
         self.top_level = top_level or set()
-        self.cycles = set(chain.from_iterable(cycles or []))
+        self.cycles = set(cycles or [])
         self.automerge = automerge
         self.conda_forge_yml_patches = conda_forge_yml_patches
         self.loaded_yaml = yaml_safe_load(self.yaml_contents)
-
-        # auto set the pr_limit for initial things
-        if self.pr_limit > 2:
-            number_pred = len(
-                [
-                    k
-                    for k, v in self.graph.nodes.items()
-                    if self.migrator_uid(v.get("payload", {}))
-                    in [
-                        vv.get("data", {})
-                        for vv in v.get("payload", {})
-                        .get("pr_info", {})
-                        .get("PRed", [])
-                    ]
-                ],
-            )
-            if number_pred == 0:
-                self.pr_limit = 2
-            elif number_pred < 7:
-                self.pr_limit = 5
         self.bump_number = bump_number
         self.max_solver_attempts = max_solver_attempts
+        self.longterm = longterm
+        self.force_pr_after_solver_attempts = force_pr_after_solver_attempts
+        self.paused = paused
+
+        self._reset_effective_graph()
 
     def filter(self, attrs: "AttrsTypedDict", not_bad_str_start: str = "") -> bool:
         """
@@ -251,7 +269,6 @@ class MigrationYaml(GraphMigrator):
                 with pushd("migrations"):
                     with open(f"{self.name}.yaml", "w") as f:
                         f.write(self.yaml_contents)
-                    eval_cmd("git add .")
 
             if self.conda_forge_yml_patches is not None:
                 with pushd(os.path.join(recipe_dir, "..")):
@@ -260,16 +277,15 @@ class MigrationYaml(GraphMigrator):
                     _patch_dict(cfg, self.conda_forge_yml_patches)
                     with open("conda-forge.yml", "w") as fp:
                         yaml_safe_dump(cfg, fp)
-                    eval_cmd("git add conda-forge.yml")
 
             with pushd(recipe_dir):
                 self.set_build_number("meta.yaml")
 
             return super().migrate(recipe_dir, attrs)
 
-    def pr_body(self, feedstock_ctx: "FeedstockContext") -> str:
+    def pr_body(self, feedstock_ctx: ClonedFeedstockContext) -> str:
         body = super().pr_body(feedstock_ctx)
-        if feedstock_ctx.package_name == "conda-forge-pinning":
+        if feedstock_ctx.feedstock_name == "conda-forge-pinning":
             additional_body = (
                 "This PR has been triggered in an effort to close out the "
                 "migration for **{name}**.\n\n"
@@ -303,8 +319,8 @@ class MigrationYaml(GraphMigrator):
                 )
             )
 
-        commit_body = " ".join(
-            [e for e in self.commit_message(feedstock_ctx).splitlines()[1:] if e],
+        commit_body = "\n> ".join(
+            self.commit_message(feedstock_ctx).splitlines()[1:],
         )
         if commit_body:
             additional_body += (
@@ -330,7 +346,7 @@ class MigrationYaml(GraphMigrator):
 
     def commit_message(self, feedstock_ctx: FeedstockContext) -> str:
         if self.name:
-            if feedstock_ctx.package_name == "conda-forge-pinning":
+            if feedstock_ctx.feedstock_name == "conda-forge-pinning":
                 return f"Close out migration for {self.name}"
             default_msg = "Rebuild for " + self.name
         else:
@@ -339,9 +355,12 @@ class MigrationYaml(GraphMigrator):
 
     def pr_title(self, feedstock_ctx: FeedstockContext) -> str:
         if (
-            feedstock_ctx.attrs.get("conda-forge.yml", {})
-            .get("bot", {})
-            .get("automerge", False)
+            get_keys_default(
+                feedstock_ctx.attrs,
+                ["conda-forge.yml", "bot", "automerge"],
+                {},
+                False,
+            )
             in {"migration", True}
         ) and self.automerge:
             add_slug = "[bot-automerge] "
@@ -399,9 +418,11 @@ class MigrationYaml(GraphMigrator):
             graph,
             key=lambda x: (
                 _not_has_error(x),
-                random.uniform(0, 1)
-                if not _not_has_error(x)
-                else len(nx.descendants(total_graph, x)),
+                (
+                    random.uniform(0, 1)
+                    if not _not_has_error(x)
+                    else len(nx.descendants(total_graph, x))
+                ),
                 x,
             ),
             reverse=True,
@@ -424,12 +445,48 @@ class MigrationYamlCreator(Migrator):
         pin_spec: str,
         feedstock_name: str,
         graph: nx.DiGraph,
-        full_graph: nx.DiGraph,
+        pin_impact: Optional[int] = None,
+        full_graph: Optional[nx.DiGraph] = None,
         pr_limit: int = 1,
         bump_number: int = 1,
+        effective_graph: nx.DiGraph = None,
+        pinnings: Optional[List[int]] = None,
         **kwargs: Any,
     ):
-        super().__init__(pr_limit=pr_limit)
+        if pinnings is None:
+            pinnings = [package_name]
+
+        if pin_impact is None:
+            if full_graph is not None:
+                pin_impact = len(create_rebuild_graph(full_graph, tuple(pinnings)))
+                full_graph = None
+            else:
+                pin_impact = -1
+
+        if not hasattr(self, "_init_args"):
+            self._init_args = [
+                package_name,
+                new_pin_version,
+                current_pin,
+                pin_spec,
+                feedstock_name,
+                graph,
+            ]
+
+        if not hasattr(self, "_init_kwargs"):
+            self._init_kwargs = {
+                "pr_limit": pr_limit,
+                "bump_number": bump_number,
+                "pin_impact": pin_impact,
+                "full_graph": full_graph,
+                "effective_graph": effective_graph,
+                "pinnings": pinnings,
+            }
+            self._init_kwargs.update(copy.deepcopy(kwargs))
+
+        super().__init__(
+            pr_limit=pr_limit, graph=graph, effective_graph=effective_graph
+        )
         self.feedstock_name = feedstock_name
         self.pin_spec = pin_spec
         self.current_pin = current_pin
@@ -439,8 +496,10 @@ class MigrationYamlCreator(Migrator):
         self.package_name = package_name
         self.bump_number = bump_number
         self.name = package_name + " pinning"
-        self.graph = graph
-        self.pin_impact = len(create_rebuild_graph(full_graph, (self.package_name,)))
+        self.pin_impact = pin_impact
+        self.pinnings = pinnings
+
+        self._reset_effective_graph()
 
     def filter(self, attrs: "AttrsTypedDict", not_bad_str_start: str = "") -> bool:
         if (
@@ -460,9 +519,11 @@ class MigrationYamlCreator(Migrator):
                 "migration_number": 1,
                 "commit_message": f"Rebuild for {self.package_name} {self.new_pin_version}",
             },
-            self.package_name: [self.new_pin_version],
             "migrator_ts": float(time.time()),
         }
+        for pkg in self.pinnings:
+            migration_yaml_dict[pkg] = [self.new_pin_version]
+
         with pushd(os.path.join(recipe_dir, "migrations")):
             mig_fname = "{}{}.yaml".format(
                 self.package_name,
@@ -473,11 +534,10 @@ class MigrationYamlCreator(Migrator):
                     migration_yaml_dict,
                     f,
                 )
-            eval_cmd("git add .")
 
         return super().migrate(recipe_dir, attrs)
 
-    def pr_body(self, feedstock_ctx: "FeedstockContext") -> str:
+    def pr_body(self, feedstock_ctx: ClonedFeedstockContext) -> str:
         body = (
             "This PR has been triggered in an effort to update the pin for"
             " **{name}**. The current pinned version is {current_pin}, "
@@ -499,8 +559,10 @@ class MigrationYamlCreator(Migrator):
                 current_pin=self.current_pin,
                 new_pin_version=self.new_pin_version,
                 feedstock_name=self.feedstock_name,
-                len_graph=self.pin_impact,
-                link=f"This PR was generated by {self.ctx.session.circle_build_url}, please use this URL for debugging",  # noqa
+                len_graph=(
+                    self.pin_impact if self.pin_impact >= 0 else "an unknown number of"
+                ),
+                link=f"This PR was generated by {get_bot_run_url()} - please use this URL for debugging.",
             )
         )  # noqa
         return body

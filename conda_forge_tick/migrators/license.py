@@ -1,17 +1,15 @@
+import logging
 import os
 import re
-import tempfile
 import subprocess
+import tempfile
 import typing
 from typing import Any
-import logging
 
-from rever.tools import replace_in_file
-
-from conda_forge_tick.os_utils import pushd, eval_cmd
-from conda_forge_tick.utils import _get_source_code
-from conda_forge_tick.recipe_parser import CondaMetaYAML
 from conda_forge_tick.migrators.core import MiniMigrator
+from conda_forge_tick.os_utils import pushd
+from conda_forge_tick.provide_source_code import provide_source_code
+from conda_forge_tick.recipe_parser import CondaMetaYAML
 
 try:
     from conda_smithy.lint_recipe import NEEDED_FAMILIES
@@ -23,7 +21,61 @@ if typing.TYPE_CHECKING:
 
 LICENSE_SPLIT = re.compile(r"\||\+")
 
-LOGGER = logging.getLogger("conda_forge_tick.migrators.license")
+logger = logging.getLogger(__name__)
+
+
+def replace_in_file(pattern, new, fname, leading_whitespace=True):
+    """Replaces a given pattern in a file. If leading whitespace is True,
+    whitespace at the beginning of a line will be captured and preserved.
+    Otherwise, the pattern itself must contain all leading whitespace.
+
+    This function is vendored from rever under their license:
+
+    BSD 3-Clause License
+
+    Copyright (c) 2017, Anthony Scopatz
+    Copyright (c) 2018, The Regro Developers
+    All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are met:
+
+    * Redistributions of source code must retain the above copyright notice, this
+    list of conditions and the following disclaimer.
+
+    * Redistributions in binary form must reproduce the above copyright notice,
+    this list of conditions and the following disclaimer in the documentation
+    and/or other materials provided with the distribution.
+
+    * Neither the name of the copyright holder nor the names of its
+    contributors may be used to endorse or promote products derived from
+    this software without specific prior written permission.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+    AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+    IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+    DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+    FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+    DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+    SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+    CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+    OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+    OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+    """
+    with open(fname) as f:
+        raw = f.read()
+    lines = raw.splitlines()
+    if leading_whitespace:
+        ptn = re.compile(r"(\s*?)" + pattern)
+    else:
+        ptn = re.compile(pattern)
+    for i, line in enumerate(lines):
+        m = ptn.match(line)
+        if m is not None:
+            lines[i] = m.group(1) + new if leading_whitespace else new
+    upd = "\n".join(lines) + "\n"
+    with open(fname, "w") as f:
+        f.write(upd)
 
 
 def _to_spdx(lic):
@@ -132,10 +184,9 @@ def _scrape_license_string(pkg):
     if pkg.startswith("r-"):
         pkg = pkg[2:]
 
-    LOGGER.info("LICENSE running cran skeleton for pkg %s" % pkg)
+    logger.info("LICENSE running cran skeleton for pkg %s" % pkg)
 
     with tempfile.TemporaryDirectory() as tmpdir, pushd(tmpdir):
-
         subprocess.run(
             [
                 "conda",
@@ -191,7 +242,7 @@ def _scrape_license_string(pkg):
 def _do_r_license_munging(pkg, recipe_dir):
     try:
         d = _scrape_license_string(pkg)
-        LOGGER.info("LICENSE R package license data: %s" % d)
+        logger.info("LICENSE R package license data: %s" % d)
 
         with open(os.path.join(recipe_dir, "meta.yaml")) as fp:
             cmeta = CondaMetaYAML(fp.read())
@@ -208,7 +259,7 @@ def _do_r_license_munging(pkg, recipe_dir):
             cmeta.dump(fp)
 
     except Exception as e:
-        LOGGER.info("LICENSE R license ERROR: %s" % repr(e))
+        logger.info("LICENSE R license ERROR: %s" % repr(e))
         pass
 
 
@@ -262,57 +313,61 @@ class LicenseMigrator(MiniMigrator):
             return
 
         try:
-            cb_work_dir = _get_source_code(recipe_dir)
+            with provide_source_code(recipe_dir) as cb_work_dir:
+                if cb_work_dir is None:
+                    return
+                with pushd(cb_work_dir):
+                    # look for a license file
+                    license_files = [
+                        s
+                        for s in os.listdir(".")
+                        if any(
+                            s.lower().startswith(k)
+                            for k in ["license", "copying", "copyright"]
+                        )
+                    ]
+
+                # if there is a license file in tarball update things
+                if license_files:
+                    with pushd(recipe_dir):
+                        """BSD 3-Clause License
+                        Copyright (c) 2017, Anthony Scopatz
+                        Copyright (c) 2018, The Regro Developers
+                        All rights reserved."""
+                        with open("meta.yaml") as f:
+                            raw = f.read()
+                        lines = raw.splitlines()
+                        ptn = re.compile(r"(\s*?)" + "license:")
+                        for i, line in enumerate(lines):
+                            m = ptn.match(line)
+                            if m is not None:
+                                break
+                        # TODO: Sketchy type assertion
+                        assert m is not None
+                        ws = m.group(1)
+                        if len(license_files) == 1:
+                            replace_in_file(
+                                line,
+                                line
+                                + "\n"
+                                + ws
+                                + f"license_file: {list(license_files)[0]}",
+                                "meta.yaml",
+                            )
+                        else:
+                            # note that this white space is not perfect but works for
+                            # most of the situations
+                            replace_in_file(
+                                line,
+                                line
+                                + "\n"
+                                + ws
+                                + "license_file: \n"
+                                + "".join(f"{ws * 2}- {z} \n" for z in license_files),
+                                "meta.yaml",
+                            )
+
+                # if license not in tarball do something!
+                # check if github in dev url, then use that to get the license
         except Exception:
             return
-        if cb_work_dir is None:
-            return
-        with pushd(cb_work_dir):
-            # look for a license file
-            license_files = [
-                s
-                for s in os.listdir(".")
-                if any(
-                    s.lower().startswith(k) for k in ["license", "copying", "copyright"]
-                )
-            ]
-        eval_cmd(f"rm -r {cb_work_dir}")
-        # if there is a license file in tarball update things
-        if license_files:
-            with pushd(recipe_dir):
-                """BSD 3-Clause License
-                Copyright (c) 2017, Anthony Scopatz
-                Copyright (c) 2018, The Regro Developers
-                All rights reserved."""
-                with open("meta.yaml") as f:
-                    raw = f.read()
-                lines = raw.splitlines()
-                ptn = re.compile(r"(\s*?)" + "license:")
-                for i, line in enumerate(lines):
-                    m = ptn.match(line)
-                    if m is not None:
-                        break
-                # TODO: Sketchy type assertion
-                assert m is not None
-                ws = m.group(1)
-                if len(license_files) == 1:
-                    replace_in_file(
-                        line,
-                        line + "\n" + ws + f"license_file: {list(license_files)[0]}",
-                        "meta.yaml",
-                    )
-                else:
-                    # note that this white space is not perfect but works for
-                    # most of the situations
-                    replace_in_file(
-                        line,
-                        line
-                        + "\n"
-                        + ws
-                        + "license_file: \n"
-                        + "".join(f"{ws*2}- {z} \n" for z in license_files),
-                        "meta.yaml",
-                    )
-
-        # if license not in tarball do something!
-        # check if github in dev url, then use that to get the license

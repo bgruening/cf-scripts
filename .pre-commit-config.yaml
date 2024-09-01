@@ -1,41 +1,36 @@
+ci:
+    autofix_commit_msg: |
+        [pre-commit.ci] auto fixes from pre-commit.com hooks
+
+        for more information, see https://pre-commit.ci
+    autofix_prs: false
+    autoupdate_commit_msg: '[pre-commit.ci] pre-commit autoupdate'
+    autoupdate_schedule: monthly
+    skip: []
+    submodules: false
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.0.1
+    rev: v4.6.0
     hooks:
       - id: end-of-file-fixer
       - id: trailing-whitespace
-  - repo: local
-    hooks:
-    - id: black
-      name: black
-      entry: black --line-length 88
-      additional_dependencies:
-        - --override-channels
-        - --channel
-        - conda-forge
-        - black=22.3.0
-      language: conda
-      types:
-        - python
+
   - repo: https://github.com/asottile/pyupgrade
-    rev: v2.29.0
+    rev: v3.17.0
     hooks:
       - id: pyupgrade
         args:
           - --py36-plus
-  - repo: https://github.com/asottile/add-trailing-comma
-    rev: v2.2.0
+
+  - repo: https://github.com/crate-ci/typos
+    rev: v1.23.6
     hooks:
-      - id: add-trailing-comma
-  - repo: https://github.com/codespell-project/codespell
-    rev: v2.1.0
+      - id: typos
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.5.6
     hooks:
-      - id: codespell
-        args:
-          - --ignore-words-list=rever,pring,pullrequest,pullrequests
-          - --exclude-file=.codespellignorelines
-          - -L=statics
-  # - repo: https://gitlab.com/pycqa/flake8
-  #   rev: 3.8.4
-  #   hooks:
-  #     - id: flake8
+      - id: ruff
+        args: [ --fix ]
+      - id: ruff-format

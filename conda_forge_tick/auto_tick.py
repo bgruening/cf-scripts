@@ -1,201 +1,195 @@
-import copy
+import gc
 import glob
 import json
-import re
-import sys
-import gc
-import random
-
-import time
-import traceback
 import logging
 import os
+import random
+import time
+import traceback
 import typing
-import tqdm
 from subprocess import CalledProcessError
 from textwrap import dedent
-from typing import (
-    Optional,
-    MutableSequence,
-    MutableSet,
-    Sequence,
-    Tuple,
-    Set,
-    Mapping,
-    MutableMapping,
-    Union,
-)
-
-if typing.TYPE_CHECKING:
-    from .cli import CLIArgs
-    from .migrators_types import (
-        MetaYamlTypedDict,
-        PackageName,
-        MigrationUidTypedDict,
-    )
-
-# from conda_forge_tick.profiler import profiling
-
-import networkx as nx
-from conda.models.version import VersionOrder
-from conda_build.config import Config
-from conda_build.variants import parse_config_file
-
+from typing import Literal, MutableMapping, cast
 from urllib.error import URLError
-
-import github3
 from uuid import uuid4
 
-from conda_forge_tick.os_utils import pushd, eval_cmd
-from conda_forge_tick.lazy_json_backends import (
-    get_all_keys_for_hashmap,
-    LazyJson,
-    remove_key_for_hashmap,
-    lazy_json_transaction,
-)
+import github
+import github3
+import networkx as nx
+import tqdm
+from conda.models.version import VersionOrder
+
+from conda_forge_tick.cli_context import CliContext
 from conda_forge_tick.contexts import (
+    ClonedFeedstockContext,
     FeedstockContext,
     MigratorSessionContext,
-    MigratorContext,
 )
+from conda_forge_tick.deploy import deploy
+from conda_forge_tick.feedstock_parser import BOOTSTRAP_MAPPINGS
 from conda_forge_tick.git_utils import (
-    get_repo,
-    push_repo,
-    is_github_api_limit_reached,
     comment_on_pr,
+    get_repo,
+    github_backend,
+    is_github_api_limit_reached,
+    push_repo,
 )
+from conda_forge_tick.lazy_json_backends import (
+    LazyJson,
+    get_all_keys_for_hashmap,
+    lazy_json_transaction,
+    remove_key_for_hashmap,
+)
+from conda_forge_tick.make_migrators import (
+    MAX_SOLVER_ATTEMPTS,
+    PR_LIMIT,
+    load_migrators,
+)
+from conda_forge_tick.migration_runner import run_migration
+from conda_forge_tick.migrators import MigrationYaml, Migrator, Version
+from conda_forge_tick.migrators.version import VersionMigrationError
+from conda_forge_tick.os_utils import eval_cmd, pushd
+from conda_forge_tick.rerender_feedstock import rerender_feedstock
+from conda_forge_tick.solver_checks import is_recipe_solvable
 from conda_forge_tick.utils import (
-    setup_logger,
-    pluck,
-    load_graph,
+    ContainerRuntimeError,
+    change_log_level,
     dump_graph,
-    CB_CONFIG,
-    parse_meta_yaml,
-    sanitize_string,
-    frozen_to_json_friendly,
-    yaml_safe_load,
-    parse_munged_run_export,
+    filter_reprinted_lines,
     fold_log_lines,
-)
-from conda_forge_tick.migrators.arch import OSXArm
-from conda_forge_tick.migrators.migration_yaml import (
-    MigrationYamlCreator,
-    create_rebuild_graph,
-)
-from conda_forge_tick.migrators import (
-    Migrator,
-    Version,
-    PipMigrator,
-    LicenseMigrator,
-    MigrationYaml,
-    Replacement,
-    ArchRebuild,
-    CondaForgeYAMLCleanup,
-    ExtraJinja2KeysCleanup,
-    Jinja2VarsCleanup,
-    UpdateConfigSubGuessMigrator,
-    UpdateCMakeArgsMigrator,
-    GuardTestingMigrator,
-    CrossRBaseMigrator,
-    CrossPythonMigrator,
-    Build2HostMigrator,
-    NoCondaInspectMigrator,
-    DuplicateLinesCleanup,
-    Cos7Config,
-    PipWheelMigrator,
-    GraphMigrator,
-    CrossCompilationForARMAndPower,
-    MPIPinRunAsBuildCleanup,
-    DependencyUpdateMigrator,
-    QtQtMainMigrator,
-    JpegTurboMigrator,
-    LibboostMigrator,
+    frozen_to_json_friendly,
+    get_bot_run_url,
+    get_keys_default,
+    get_migrator_name,
+    load_existing_graph,
+    sanitize_string,
 )
 
-from conda_forge_feedstock_check_solvable import is_recipe_solvable
+from .migrators_types import MigrationUidTypedDict
 
-# not using this right now
-# from conda_forge_tick.deploy import deploy
+logger = logging.getLogger(__name__)
 
-LOGGER = logging.getLogger("conda_forge_tick.auto_tick")
-
-PR_LIMIT = 5
-MAX_PR_LIMIT = 50
-MAX_SOLVER_ATTEMPTS = 50
-CHECK_SOLVABLE_TIMEOUT = 90  # 90 days
-
-BOT_RERUN_LABEL = {
-    "name": "bot-rerun",
-    "color": "#191970",
-    "description": (
-        "Apply this label if you want the bot to retry "
-        "issuing a particular pull-request"
-    ),
-}
-
-BOT_HOME_DIR = None
+BOT_HOME_DIR: str = os.getcwd()
+START_TIME = None
+TIMEOUT = int(os.environ.get("TIMEOUT", 600))
 
 # migrator runs on loop so avoid any seeds at current time should that happen
 random.seed(os.urandom(64))
 
 
-def _set_pre_pr_migrator_fields(attrs, migrator_name, error_str):
-    pre_key = "pre_pr_migrator_status"
-    pre_key_att = "pre_pr_migrator_attempts"
+def _set_pre_pr_migrator_error(attrs, migrator_name, error_str, *, is_version):
+    if is_version:
+        with attrs["version_pr_info"] as vpri:
+            version = vpri["new_version"]
+            if "new_version_errors" not in vpri:
+                vpri["new_version_errors"] = {}
+            vpri["new_version_errors"][version] = sanitize_string(error_str)
+    else:
+        pre_key = "pre_pr_migrator_status"
 
-    with attrs["pr_info"] as pri:
-        if pre_key not in pri:
-            pri[pre_key] = {}
-        pri[pre_key][migrator_name] = sanitize_string(
-            error_str,
+        with attrs["pr_info"] as pri:
+            if pre_key not in pri:
+                pri[pre_key] = {}
+            pri[pre_key][migrator_name] = sanitize_string(
+                error_str,
+            )
+
+
+def _increment_pre_pr_migrator_attempt(attrs, migrator_name, *, is_version):
+    if is_version:
+        with attrs["version_pr_info"] as vpri:
+            version = vpri["new_version"]
+            if "new_version_attempts" not in vpri:
+                vpri["new_version_attempts"] = {}
+            if version not in vpri["new_version_attempts"]:
+                vpri["new_version_attempts"][version] = 0
+            vpri["new_version_attempts"][version] += 1
+    else:
+        pre_key_att = "pre_pr_migrator_attempts"
+
+        with attrs["pr_info"] as pri:
+            if pre_key_att not in pri:
+                pri[pre_key_att] = {}
+            if migrator_name not in pri[pre_key_att]:
+                pri[pre_key_att][migrator_name] = 0
+            pri[pre_key_att][migrator_name] += 1
+
+
+def _reset_pre_pr_migrator_fields(attrs, migrator_name, *, is_version):
+    if is_version:
+        with attrs["version_pr_info"] as vpri:
+            version = vpri["new_version"]
+            for _key in ["new_version_errors", "new_version_attempts"]:
+                if _key in vpri and version in vpri[_key]:
+                    vpri[_key].pop(version)
+    else:
+        pre_key = "pre_pr_migrator_status"
+        pre_key_att = "pre_pr_migrator_attempts"
+        with attrs["pr_info"] as pri:
+            for _key in [pre_key, pre_key_att]:
+                if _key in pri and migrator_name in pri[_key]:
+                    pri[_key].pop(migrator_name)
+
+
+def _get_pre_pr_migrator_attempts(attrs, migrator_name, *, is_version):
+    if is_version:
+        with attrs["version_pr_info"] as vpri:
+            return vpri.get("new_version_attempts", {}).get(vpri["new_version"], 0)
+    else:
+        with attrs["pr_info"] as pri:
+            return pri.get("pre_pr_migrator_attempts", {}).get(migrator_name, 0)
+
+
+def run_with_tmpdir(
+    context: FeedstockContext,
+    migrator: Migrator,
+    rerender: bool = True,
+    base_branch: str = "main",
+    dry_run: bool = False,
+    **kwargs: typing.Any,
+) -> tuple[MigrationUidTypedDict, dict] | tuple[Literal[False], Literal[False]]:
+    """
+    For a given feedstock and migration run the migration in a temporary directory that will be deleted after the
+    migration is complete.
+
+    The parameters are the same as for the `run` function. The only difference is that you pass a FeedstockContext
+    instance instead of a ClonedFeedstockContext instance.
+
+    The exceptions are the same as for the `run` function.
+    """
+    with context.reserve_clone_directory() as cloned_context:
+        return run(
+            context=cloned_context,
+            migrator=migrator,
+            rerender=rerender,
+            base_branch=base_branch,
+            dry_run=dry_run,
+            **kwargs,
         )
-
-        if pre_key_att not in pri:
-            pri[pre_key_att] = {}
-        if migrator_name not in pri[pre_key_att]:
-            pri[pre_key_att][migrator_name] = 0
-        pri[pre_key_att][migrator_name] += 1
-
-
-def _reset_pre_pr_migrator_fields(attrs, migrator_name):
-    pre_key = "pre_pr_migrator_status"
-    pre_key_att = "pre_pr_migrator_attempts"
-    with attrs["pr_info"] as pri:
-        for _key in [pre_key, pre_key_att]:
-            if _key in pri and migrator_name in pri[_key]:
-                pri[_key].pop(migrator_name)
 
 
 def run(
-    feedstock_ctx: FeedstockContext,
+    context: ClonedFeedstockContext,
     migrator: Migrator,
-    protocol: str = "ssh",
-    pull_request: bool = True,
     rerender: bool = True,
-    fork: bool = True,
     base_branch: str = "main",
+    dry_run: bool = False,
     **kwargs: typing.Any,
-) -> Tuple["MigrationUidTypedDict", dict]:
+) -> tuple[MigrationUidTypedDict, dict] | tuple[Literal[False], Literal[False]]:
     """For a given feedstock and migration run the migration
 
     Parameters
     ----------
-    feedstock_ctx: FeedstockContext
-        The node attributes
+    context: ClonedFeedstockContext
+        The current feedstock context, already containing information about a temporary directory for the feedstock.
     migrator: Migrator instance
         The migrator to run on the feedstock
-    protocol : str, optional
-        The git protocol to use, defaults to ``ssh``
-    pull_request : bool, optional
-        If true issue pull request, defaults to true
     rerender : bool
         Whether to rerender
-    fork : bool
-        If true create a fork, defaults to true
     base_branch : str, optional
         The base branch to which the PR will be targeted. Defaults to "main".
     kwargs: dict
-        The key word arguments to pass to the migrator
+        The keyword arguments to pass to the migrator.
 
     Returns
     -------
@@ -209,72 +203,60 @@ def run(
     os.chdir(BOT_HOME_DIR)
 
     # get the repo
-    # TODO: stop doing this.
-    migrator.attrs = feedstock_ctx.attrs  # type: ignore
+    branch_name = migrator.remote_branch(context) + "_h" + uuid4().hex[0:6]
 
-    branch_name = migrator.remote_branch(feedstock_ctx) + "_h" + uuid4().hex[0:6]
-
-    if hasattr(migrator, "name"):
-        assert isinstance(migrator.name, str)
-        migrator_name = migrator.name.lower().replace(" ", "")
-    else:
-        migrator_name = migrator.__class__.__name__.lower()
+    migrator_name = get_migrator_name(migrator)
+    is_version_migration = isinstance(migrator, Version)
+    _increment_pre_pr_migrator_attempt(
+        context.attrs,
+        migrator_name,
+        is_version=is_version_migration,
+    )
 
     # TODO: run this in parallel
-    feedstock_dir, repo = get_repo(
-        ctx=migrator.ctx.session,
-        fctx=feedstock_ctx,
-        branch=branch_name,
-        feedstock=feedstock_ctx.feedstock_name,
-        protocol=protocol,
-        pull_request=pull_request,
-        fork=fork,
-        base_branch=base_branch,
-    )
+    repo = get_repo(context=context, branch=branch_name, base_branch=base_branch)
+
+    feedstock_dir = str(context.local_clone_dir)
     if not feedstock_dir or not repo:
-        LOGGER.critical(
+        logger.critical(
             "Failed to migrate %s, %s",
-            feedstock_ctx.package_name,
-            feedstock_ctx.attrs.get("pr_info", {}).get("bad"),
+            context.feedstock_name,
+            context.attrs.get("pr_info", {}).get("bad"),
         )
         return False, False
 
-    recipe_dir = os.path.join(feedstock_dir, "recipe")
+    # need to use an absolute path here
+    feedstock_dir = os.path.abspath(feedstock_dir)
 
-    # migrate the feedstock
-    migrator.run_pre_piggyback_migrations(recipe_dir, feedstock_ctx.attrs, **kwargs)
+    migration_run_data = run_migration(
+        migrator=migrator,
+        feedstock_dir=feedstock_dir,
+        feedstock_name=context.feedstock_name,
+        node_attrs=context.attrs,
+        default_branch=context.default_branch,
+        **kwargs,
+    )
 
-    # TODO - make a commit here if the repo changed
-
-    migrate_return = migrator.migrate(recipe_dir, feedstock_ctx.attrs, **kwargs)
-
-    if not migrate_return:
-        LOGGER.critical(
+    if not migration_run_data["migrate_return_value"]:
+        logger.critical(
             "Failed to migrate %s, %s",
-            feedstock_ctx.package_name,
-            feedstock_ctx.attrs.get("pr_info", {}).get("bad"),
+            context.feedstock_name,
+            context.attrs.get("pr_info", {}).get("bad"),
         )
-        eval_cmd(f"rm -rf {feedstock_dir}")
         return False, False
-
-    # TODO - commit main migration here
-
-    migrator.run_post_piggyback_migrations(recipe_dir, feedstock_ctx.attrs, **kwargs)
-
-    # TODO commit post migration here
 
     # rerender, maybe
     diffed_files: typing.List[str] = []
     with pushd(feedstock_dir):
-        msg = migrator.commit_message(feedstock_ctx)  # noqa
+        msg = migration_run_data["commit_message"]
         try:
-            eval_cmd("git add --all .")
+            eval_cmd(["git", "add", "--all", "."])
             if migrator.allow_empty_commits:
-                eval_cmd(f"git commit --allow-empty -am '{msg}'")
+                eval_cmd(["git", "commit", "--allow-empty", "-am", msg])
             else:
-                eval_cmd(f"git commit -am '{msg}'")
+                eval_cmd(["git", "commit", "-am", msg])
         except CalledProcessError as e:
-            LOGGER.info(
+            logger.info(
                 "could not commit to feedstock - "
                 "likely no changes - error is '%s'" % (repr(e)),
             )
@@ -285,14 +267,14 @@ def run(
                 raise e
 
         if rerender:
-            head_ref = eval_cmd("git rev-parse HEAD").strip()
-            LOGGER.info("Rerendering the feedstock")
+            head_ref = eval_cmd(["git", "rev-parse", "HEAD"]).strip()
+            logger.info("Rerendering the feedstock")
 
             try:
-                eval_cmd(
-                    "conda smithy rerender -c auto --no-check-uptodate",
-                    timeout=900,
-                )
+                rerender_msg = rerender_feedstock(feedstock_dir, timeout=900)
+                if rerender_msg is not None:
+                    eval_cmd(["git", "commit", "--allow-empty", "-am", rerender_msg])
+
                 make_rerender_comment = False
             except Exception as e:
                 # I am trying this bit of code to force these errors
@@ -302,16 +284,16 @@ def run(
                     raise
                 else:
                     # for check solvable or automerge, we always raise rerender errors
-                    if feedstock_ctx.attrs["conda-forge.yml"].get("bot", {}).get(
-                        "check_solvable",
+                    if get_keys_default(
+                        context.attrs,
+                        ["conda-forge.yml", "bot", "check_solvable"],
+                        {},
                         False,
-                    ) or (
-                        feedstock_ctx.attrs["conda-forge.yml"]
-                        .get("bot", {})
-                        .get(
-                            "automerge",
-                            False,
-                        )
+                    ) or get_keys_default(
+                        context.attrs,
+                        ["conda-forge.yml", "bot", "automerge"],
+                        {},
+                        False,
                     ):
                         raise
                     else:
@@ -320,7 +302,9 @@ def run(
             # If we tried to run the MigrationYaml and rerender did nothing (we only
             # bumped the build number and dropped a yaml file in migrations) bail
             # for instance platform specific migrations
-            gdiff = eval_cmd(f"git diff --name-only {head_ref.strip()}...HEAD")
+            gdiff = eval_cmd(
+                ["git", "diff", "--name-only", f"{head_ref.strip()}...HEAD"]
+            )
 
             diffed_files = [
                 _
@@ -334,37 +318,73 @@ def run(
         else:
             make_rerender_comment = False
 
+    feedstock_automerge = get_keys_default(
+        context.attrs,
+        ["conda-forge.yml", "bot", "automerge"],
+        {},
+        False,
+    )
+    if isinstance(migrator, Version):
+        has_automerge = feedstock_automerge in [True, "version"]
+    else:
+        has_automerge = getattr(
+            migrator, "automerge", False
+        ) and feedstock_automerge in [True, "migration"]
+
+    migrator_check_solvable = getattr(migrator, "check_solvable", True)
+    feedstock_check_solvable = get_keys_default(
+        context.attrs,
+        ["conda-forge.yml", "bot", "check_solvable"],
+        {},
+        False,
+    )
+    pr_attempts = _get_pre_pr_migrator_attempts(
+        context.attrs,
+        migrator_name,
+        is_version=is_version_migration,
+    )
+    max_pr_attempts = getattr(
+        migrator, "force_pr_after_solver_attempts", MAX_SOLVER_ATTEMPTS * 2
+    )
+
+    logger.info(
+        f"""automerge and check_solvable status/settings:
+    automerge:
+        feedstock_automerge: {feedstock_automerge}
+        migratror_automerge: {getattr(migrator, 'automerge', False)}
+        has_automerge: {has_automerge} (only considers feedstock if version migration)
+    check_solvable:
+        feedstock_checksolvable: {feedstock_check_solvable}
+        migrator_check_solvable: {migrator_check_solvable}
+    pre_pr_migrator_attempts: {pr_attempts}
+    force_pr_after_solver_attempts: {max_pr_attempts}
+"""
+    )
+
     if (
-        feedstock_ctx.feedstock_name != "conda-forge-pinning"
+        context.feedstock_name != "conda-forge-pinning"
         and (base_branch == "master" or base_branch == "main")
-        and (
-            (
-                migrator.check_solvable
-                # we always let stuff in cycles go
-                and feedstock_ctx.attrs["name"]
-                not in getattr(migrator, "cycles", set())
-                # we always let stuff at the top go
-                and feedstock_ctx.attrs["name"]
-                not in getattr(migrator, "top_level", set())
-            )
-            or feedstock_ctx.attrs["conda-forge.yml"]
-            .get("bot", {})
-            .get(
-                "check_solvable",
-                False,
-            )
-        )
+        # feedstocks that have problematic bootstrapping will not always be solvable
+        and context.feedstock_name not in BOOTSTRAP_MAPPINGS
+        # stuff in cycles always goes
+        and context.attrs["name"] not in getattr(migrator, "cycles", set())
+        # stuff at the top always goes
+        and context.attrs["name"] not in getattr(migrator, "top_level", set())
+        # either the migrator or the feedstock has to request solver checks
+        and (migrator_check_solvable or feedstock_check_solvable)
+        # we try up to MAX_SOLVER_ATTEMPTS times and then we just skip
+        # the solver check and issue the PR if automerge is off
+        and (has_automerge or (pr_attempts < max_pr_attempts))
     ):
         solvable, errors, _ = is_recipe_solvable(
             feedstock_dir,
-            build_platform=feedstock_ctx.attrs["conda-forge.yml"].get(
+            build_platform=context.attrs["conda-forge.yml"].get(
                 "build_platform",
                 None,
             ),
-            verbosity=2,
         )
         if not solvable:
-            ci_url = os.getenv("CIRCLE_BUILD_URL")
+            ci_url = get_bot_run_url()
             ci_url = f"(<a href='{ci_url}'>bot CI job</a>)" if ci_url else ""
             _solver_err_str = dedent(
                 f"""
@@ -379,35 +399,32 @@ def run(
                 """,
             ).strip()
 
-            if isinstance(migrator, Version):
-                with feedstock_ctx.attrs["version_pr_info"] as vpri:
-                    _new_ver = vpri["new_version"]
-                    vpri["new_version_errors"][_new_ver] = _solver_err_str
-                    vpri["new_version_errors"][_new_ver] = sanitize_string(
-                        vpri["new_version_errors"][_new_ver],
-                    )
-                    # remove part of a try for solver errors to make those slightly
-                    # higher priority
-                    vpri["new_version_attempts"][_new_ver] -= 0.8
-            else:
-                # these are not used for version migrations
-                _set_pre_pr_migrator_fields(
-                    feedstock_ctx.attrs,
-                    migrator_name,
-                    sanitize_string(_solver_err_str),
-                )
+            _set_pre_pr_migrator_error(
+                context.attrs,
+                migrator_name,
+                _solver_err_str,
+                is_version=is_version_migration,
+            )
 
-            eval_cmd(f"rm -rf {feedstock_dir}")
+            # remove part of a try for solver errors to make those slightly
+            # higher priority next time the bot runs
+            if isinstance(migrator, Version):
+                with context.attrs["version_pr_info"] as vpri:
+                    _new_ver = vpri["new_version"]
+                    vpri["new_version_attempts"][_new_ver] -= 0.8
+
             return False, False
         else:
-            _reset_pre_pr_migrator_fields(feedstock_ctx.attrs, migrator_name)
+            _reset_pre_pr_migrator_fields(
+                context.attrs, migrator_name, is_version=is_version_migration
+            )
 
     # TODO: Better annotation here
     pr_json: typing.Union[MutableMapping, None, bool]
     if (
         isinstance(migrator, MigrationYaml)
         and not diffed_files
-        and feedstock_ctx.attrs["name"] != "conda-forge-pinning"
+        and context.attrs["name"] != "conda-forge-pinning"
     ):
         # spoof this so it looks like the package is done
         pr_json = {
@@ -418,19 +435,15 @@ def run(
     else:
         # push up
         try:
-            # TODO: remove this hack, but for now this is the only way to get
-            # the feedstock dir into pr_body
-            feedstock_ctx.feedstock_dir = feedstock_dir
             pr_json = push_repo(
-                session_ctx=migrator.ctx.session,
-                fctx=feedstock_ctx,
+                fctx=context,
                 feedstock_dir=feedstock_dir,
-                body=migrator.pr_body(feedstock_ctx),
+                body=migration_run_data["pr_body"],
                 repo=repo,
-                title=migrator.pr_title(feedstock_ctx),
-                head=f"{migrator.ctx.github_username}:{branch_name}",
+                title=migration_run_data["pr_title"],
                 branch=branch_name,
                 base_branch=base_branch,
+                dry_run=dry_run,
             )
 
         # This shouldn't happen too often any more since we won't double PR
@@ -465,631 +478,24 @@ comment. Hopefully you all can fix this!
         ljpr = False
 
     # If we've gotten this far then the node is good
-    with feedstock_ctx.attrs["pr_info"] as pri:
+    with context.attrs["pr_info"] as pri:
         pri["bad"] = False
-    _reset_pre_pr_migrator_fields(feedstock_ctx.attrs, migrator_name)
-
-    LOGGER.info("Removing feedstock dir")
-    eval_cmd(f"rm -rf {feedstock_dir}")
-    return migrate_return, ljpr
-
-
-def _host_run_test_dependencies(meta_yaml: "MetaYamlTypedDict") -> Set["PackageName"]:
-    """Parse the host/run/test dependencies of a recipe
-
-    This function parses top-level and `outputs` requirements sections.
-
-    The complicated logic here is mainly to support not including a
-    `host` section, and using `build` instead.
-    """
-    _ = meta_yaml["requirements"]
-    rq = (_["host"] or _["build"]) | _["run"] | _["test"]
-    return typing.cast("Set[PackageName]", rq)
-
-
-def add_replacement_migrator(
-    migrators: MutableSequence[Migrator],
-    gx: nx.DiGraph,
-    old_pkg: "PackageName",
-    new_pkg: "PackageName",
-    rationale: str,
-    alt_migrator: Union[Migrator, None] = None,
-) -> None:
-    """Adds a migrator to replace one package with another.
-
-    Parameters
-    ----------
-    migrators : list of Migrator
-        The list of migrators to run.
-    gx : graph
-        The conda-forge dependency graph.
-    old_pkg : str
-        The package to be replaced.
-    new_pkg : str
-        The package to replace the `old_pkg`.
-    rationale : str
-        The reason the for the migration. Should be a full statement.
-    alt_migrator : Replacement migrator or a sublcass thereof
-        An alternate Replacement migrator to use for special tasks.
-
-    """
-    print(
-        "========================================"
-        "========================================",
-        flush=True,
-    )
-    print(f"making replacement migrator for {old_pkg} -> {new_pkg}", flush=True)
-    total_graph = copy.deepcopy(gx)
-
-    for node, node_attrs in gx.nodes.items():
-        requirements = node_attrs["payload"].get("requirements", {})
-        rq = (
-            requirements.get("build", set())
-            | requirements.get("host", set())
-            | requirements.get("run", set())
-            | requirements.get("test", set())
-        )
-        pkgs = {old_pkg}
-        old_pkg_c = pkgs.intersection(rq)
-
-        if not old_pkg_c:
-            pluck(total_graph, node)
-
-    # post plucking we can have several strange cases, lets remove all selfloops
-    total_graph.remove_edges_from(nx.selfloop_edges(total_graph))
-
-    if alt_migrator is not None:
-        migrators.append(
-            alt_migrator(
-                old_pkg=old_pkg,
-                new_pkg=new_pkg,
-                rationale=rationale,
-                pr_limit=PR_LIMIT,
-                graph=total_graph,
-            ),
-        )
-    else:
-        migrators.append(
-            Replacement(
-                old_pkg=old_pkg,
-                new_pkg=new_pkg,
-                rationale=rationale,
-                pr_limit=PR_LIMIT,
-                graph=total_graph,
-            ),
-        )
-
-
-def add_arch_migrate(migrators: MutableSequence[Migrator], gx: nx.DiGraph) -> None:
-    """Adds rebuild migrators.
-
-    Parameters
-    ----------
-    migrators : list of Migrator
-        The list of migrators to run.
-
-    """
-    print(
-        "========================================"
-        "========================================",
-        flush=True,
-    )
-    print("making aarch64+ppc64le and osx-arm64 migrations", flush=True)
-    total_graph = copy.deepcopy(gx)
-
-    migrators.append(
-        ArchRebuild(
-            graph=total_graph,
-            pr_limit=PR_LIMIT,
-            name="aarch64 and ppc64le addition",
-        ),
-    )
-    migrators.append(
-        OSXArm(
-            graph=total_graph,
-            pr_limit=PR_LIMIT,
-            name="arm osx addition",
-            piggy_back_migrations=[
-                Build2HostMigrator(),
-                UpdateConfigSubGuessMigrator(),
-                CondaForgeYAMLCleanup(),
-                UpdateCMakeArgsMigrator(),
-                GuardTestingMigrator(),
-                CrossRBaseMigrator(),
-                CrossPythonMigrator(),
-                NoCondaInspectMigrator(),
-                MPIPinRunAsBuildCleanup(),
-            ],
-        ),
+    _reset_pre_pr_migrator_fields(
+        context.attrs, migrator_name, is_version=is_version_migration
     )
 
-
-def add_rebuild_migration_yaml(
-    migrators: MutableSequence[Migrator],
-    gx: nx.DiGraph,
-    package_names: Sequence[str],
-    output_to_feedstock: Mapping[str, str],
-    excluded_feedstocks: MutableSet[str],
-    exclude_pinned_pkgs: bool,
-    migration_yaml: str,
-    config: dict = {},
-    migration_name: str = "",
-    pr_limit: int = PR_LIMIT,
-    max_solver_attempts: int = 3,
-) -> None:
-    """Adds rebuild migrator.
-
-    Parameters
-    ----------
-    migrators : list of Migrator
-        The list of migrators to run.
-    gx : networkx.DiGraph
-        The feedstock graph
-    package_names : list of str
-        The package who's pin was moved
-    output_to_feedstock : dict of str
-        Mapping of output name to feedstock name
-    excluded_feedstocks : set of str
-        Feedstock names which should never be included in the migration
-    exclude_pinned_pkgs : bool
-        Whether pinned packages should be excluded from the migration
-    migration_yaml : str
-        The raw yaml for the migration variant dict
-    config: dict
-        The __migrator contents of the migration
-    migration_name: str
-        Name of the migration
-    pr_limit : int, optional
-        The number of PRs per hour, defaults to 5
-    """
-
-    total_graph = create_rebuild_graph(
-        gx,
-        package_names,
-        excluded_feedstocks,
-        exclude_pinned_pkgs=exclude_pinned_pkgs,
-        include_noarch=config.get("include_noarch", False),
-    )
-
-    # Note at this point the graph is made of all packages that have a
-    # dependency on the pinned package via Host, run, or test.
-    # Some packages don't have a host section so we use their
-    # build section in its place.
-
-    feedstock_names = set()
-    for p in package_names:
-        feedstock_names |= output_to_feedstock.get(p, {p})
-
-    feedstock_names = {
-        p for p in feedstock_names if p in gx.nodes
-    } - excluded_feedstocks
-
-    top_level = {
-        node
-        for node in {
-            gx.successors(feedstock_name) for feedstock_name in feedstock_names
-        }
-        if (node in total_graph) and len(list(total_graph.predecessors(node))) == 0
-    }
-    piggy_back_migrations = [
-        Jinja2VarsCleanup(),
-        DuplicateLinesCleanup(),
-        PipMigrator(),
-        LicenseMigrator(),
-        CondaForgeYAMLCleanup(),
-        ExtraJinja2KeysCleanup(),
-        Build2HostMigrator(),
-        NoCondaInspectMigrator(),
-        Cos7Config(),
-        CrossCompilationForARMAndPower(),
-        MPIPinRunAsBuildCleanup(),
-    ]
-    if migration_name == "qt515":
-        piggy_back_migrations.append(QtQtMainMigrator())
-    if migration_name == "jpeg_to_libjpeg_turbo":
-        piggy_back_migrations.append(JpegTurboMigrator())
-    if migration_name == "boost_cpp_to_libboost":
-        piggy_back_migrations.append(LibboostMigrator())
-    cycles = list(nx.simple_cycles(total_graph))
-    migrator = MigrationYaml(
-        migration_yaml,
-        graph=total_graph,
-        pr_limit=pr_limit,
-        name=migration_name,
-        top_level=top_level,
-        cycles=cycles,
-        piggy_back_migrations=piggy_back_migrations,
-        max_solver_attempts=max_solver_attempts,
-        **config,
-    )
-    print(f"migration yaml:\n {migration_yaml}", flush=True)
-    print(f"bump number: {migrator.bump_number}\n", flush=True)
-    migrators.append(migrator)
-
-
-def migration_factory(
-    migrators: MutableSequence[Migrator],
-    gx: nx.DiGraph,
-    pr_limit: int = PR_LIMIT,
-    only_keep=None,
-) -> None:
-    migration_yamls = []
-    migrations_loc = os.path.join(
-        os.environ["CONDA_PREFIX"],
-        "share",
-        "conda-forge",
-        "migrations",
-    )
-    with pushd(migrations_loc):
-        for yaml_file in glob.glob("*.y*ml"):
-            with open(yaml_file) as f:
-                yaml_contents = f.read()
-            migration_yamls.append((yaml_file, yaml_contents))
-
-    if only_keep is None:
-        only_keep = [
-            os.path.splitext(os.path.basename(yaml_file))[0]
-            for yaml_file, _ in migration_yamls
-        ]
-
-    output_to_feedstock = gx.graph["outputs_lut"]
-    all_package_names = set(
-        sum(
-            (
-                list(node.get("payload", {}).get("outputs_names", set()))
-                for node in gx.nodes.values()
-            ),
-            [],
-        ),
-    )
-    for yaml_file, yaml_contents in migration_yamls:
-        loaded_yaml = yaml_safe_load(yaml_contents)
-        __mname = os.path.splitext(os.path.basename(yaml_file))[0]
-
-        if __mname not in only_keep:
-            continue
-
-        print(
-            "========================================"
-            "========================================\n"
-            f"migrator: {__mname}",
-            flush=True,
-        )
-
-        migrator_config = loaded_yaml.get("__migrator", {})
-        paused = migrator_config.pop("paused", False)
-        excluded_feedstocks = set(migrator_config.get("exclude", []))
-        pr_limit = min(migrator_config.pop("pr_limit", pr_limit), MAX_PR_LIMIT)
-        max_solver_attempts = min(
-            migrator_config.pop("max_solver_attempts", 3),
-            MAX_SOLVER_ATTEMPTS,
-        )
-
-        if "override_cbc_keys" in migrator_config:
-            package_names = set(migrator_config.get("override_cbc_keys"))
-        else:
-            package_names = (
-                set(loaded_yaml) | {ly.replace("_", "-") for ly in loaded_yaml}
-            ) & all_package_names
-        exclude_pinned_pkgs = migrator_config.get("exclude_pinned_pkgs", True)
-
-        age = time.time() - loaded_yaml.get("migrator_ts", time.time())
-        age /= 24 * 60 * 60
-        print(
-            "migrator %s is %d days old" % (__mname, int(age)),
-            flush=True,
-        )
-        if (
-            age > CHECK_SOLVABLE_TIMEOUT
-            and "check_solvable" not in migrator_config
-            and not migrator_config.get("longterm", False)
-        ):
-            migrator_config["check_solvable"] = False
-            print(
-                "turning off solver checks for migrator "
-                "%s since over %d is over limit %d"
-                % (
-                    __mname,
-                    age,
-                    CHECK_SOLVABLE_TIMEOUT,
-                ),
-                flush=True,
-            )
-            skip_solver_checks = True
-        else:
-            skip_solver_checks = False
-
-        if not paused:
-            add_rebuild_migration_yaml(
-                migrators=migrators,
-                gx=gx,
-                package_names=list(package_names),
-                output_to_feedstock=output_to_feedstock,
-                excluded_feedstocks=excluded_feedstocks,
-                exclude_pinned_pkgs=exclude_pinned_pkgs,
-                migration_yaml=yaml_contents,
-                migration_name=os.path.splitext(yaml_file)[0],
-                config=migrator_config,
-                pr_limit=pr_limit,
-                max_solver_attempts=max_solver_attempts,
-            )
-            if skip_solver_checks:
-                assert not migrators[-1].check_solvable
-        else:
-            LOGGER.warning("skipping migration %s because it is paused", __mname)
-
-
-def _outside_pin_range(pin_spec, current_pin, new_version):
-    pin_level = len(pin_spec.split("."))
-    current_split = current_pin.split(".")
-    new_split = new_version.split(".")
-    # if our pin spec is more exact than our current pin then rebuild more precisely
-    if pin_level > len(current_split):
-        return True
-    for i in range(pin_level):
-        if current_split[i] != new_split[i]:
-            return True
-    return False
-
-
-def create_migration_yaml_creator(migrators: MutableSequence[Migrator], gx: nx.DiGraph):
-    cfp_gx = copy.deepcopy(gx)
-    for node in list(cfp_gx.nodes):
-        if node != "conda-forge-pinning":
-            pluck(cfp_gx, node)
-
-    print("pinning migrations", flush=True)
-    with pushd(os.environ["CONDA_PREFIX"]):
-        pinnings = parse_config_file(
-            "conda_build_config.yaml",
-            config=Config(**CB_CONFIG),
-        )
-    feedstocks_to_be_repinned = []
-    for pinning_name, package_pin_list in pinnings.items():
-        # there are three things:
-        # pinning_name - entry in pinning file
-        # package_name - the actual package, could differ via `-` -> `_`
-        #                from pinning_name
-        # feedstock_name - the feedstock that outputs the package
-        # we need the package names for the migrator itself but need the
-        # feedstock for everything else
-
-        # exclude non-package keys
-        if pinning_name not in gx.graph["outputs_lut"]:
-            # conda_build_config.yaml can't have `-` unlike our package names
-            package_name = pinning_name.replace("_", "-")
-        else:
-            package_name = pinning_name
-
-        # replace sub-packages with their feedstock names
-        # TODO - we are grabbing one element almost at random here
-        # the sorted call makes it stable at least?
-        fs_name = next(
-            iter(
-                sorted(gx.graph["outputs_lut"].get(package_name, {package_name})),
-            ),
-        )
-
-        if (
-            (fs_name in gx.nodes)
-            and not gx.nodes[fs_name]["payload"].get("archived", False)
-            and gx.nodes[fs_name]["payload"].get("version")
-            and fs_name not in feedstocks_to_be_repinned
-        ):
-
-            current_pins = list(map(str, package_pin_list))
-            current_version = str(gx.nodes[fs_name]["payload"]["version"])
-
-            try:
-                # we need a special parsing for pinning stuff
-                meta_yaml = parse_meta_yaml(
-                    gx.nodes[fs_name]["payload"]["raw_meta_yaml"],
-                    for_pinning=True,
-                )
-
-                # find the most stringent max pin for this feedstock if any
-                pin_spec = ""
-                for block in [meta_yaml] + meta_yaml.get("outputs", []) or []:
-                    build = block.get("build", {}) or {}
-
-                    # parse back to dict
-                    possible_p_dicts = [
-                        parse_munged_run_export(p) for p in build.get("run_exports", [])
-                    ]
-
-                    # and check the exported package is within the feedstock
-                    exports = [
-                        p.get("max_pin", "")
-                        for p in possible_p_dicts
-                        # make certain not direct hard pin
-                        if isinstance(p, MutableMapping)
-                        # ensure the export is for this package
-                        and p.get("package_name", "") == package_name
-                        # ensure the pinned package is in an output of the
-                        # parent feedstock
-                        and (
-                            fs_name
-                            in gx.graph["outputs_lut"].get(
-                                p.get("package_name", ""),
-                                set(),
-                            )
-                        )
-                    ]
-                    if not exports:
-                        continue
-                    # get the most stringent pin spec from the recipe block
-                    max_pin = max(exports, key=len)
-                    if len(max_pin) > len(pin_spec):
-                        pin_spec = max_pin
-
-                # fall back to the pinning file or "x"
-                if not pin_spec:
-                    pin_spec = (
-                        pinnings["pin_run_as_build"]
-                        .get(pinning_name, {})
-                        .get("max_pin", "x")
-                    ) or "x"
-
-                current_pins = list(
-                    map(lambda x: re.sub("[^0-9.]", "", x).rstrip("."), current_pins),
-                )
-                current_pins = [cp.strip() for cp in current_pins if cp.strip() != ""]
-                current_version = re.sub("[^0-9.]", "", current_version).rstrip(".")
-                if not current_pins or current_version == "":
-                    continue
-
-                current_pin = str(max(map(VersionOrder, current_pins)))
-                # If the current pin and the current version is the same nothing
-                # to do even if the pin isn't accurate to the spec
-                if current_pin != current_version and _outside_pin_range(
-                    pin_spec,
-                    current_pin,
-                    current_version,
-                ):
-                    feedstocks_to_be_repinned.append(fs_name)
-                    print("    %s:" % pinning_name, flush=True)
-                    print("        package name:", package_name, flush=True)
-                    print("        feedstock name:", fs_name, flush=True)
-                    for p in possible_p_dicts:
-                        print("        possible pin spec:", p, flush=True)
-                    print(
-                        "        migrator:\n"
-                        "            curr version: %s\n"
-                        "            curr pin: %s\n"
-                        "            pin_spec: %s"
-                        % (current_version, current_pin, pin_spec),
-                        flush=True,
-                    )
-                    migrators.append(
-                        MigrationYamlCreator(
-                            pinning_name,
-                            current_version,
-                            current_pin,
-                            pin_spec,
-                            fs_name,
-                            cfp_gx,
-                            full_graph=gx,
-                        ),
-                    )
-            except Exception as e:
-                LOGGER.info(
-                    "failed to possibly generate pinning PR for {}: {}".format(
-                        pinning_name,
-                        repr(e),
-                    ),
-                )
-                continue
-    print(" ", flush=True)
-
-
-def initialize_migrators(
-    github_username: str = "",
-    github_password: str = "",
-    github_token: Optional[str] = None,
-    dry_run: bool = False,
-) -> Tuple[MigratorSessionContext, list, MutableSequence[Migrator]]:
-    temp = glob.glob("/tmp/*")
-    gx = load_graph()
-    smithy_version = eval_cmd("conda smithy --version").strip()
-    pinning_version = json.loads(eval_cmd("conda list conda-forge-pinning --json"))[0][
-        "version"
-    ]
-
-    migrators = []
-
-    with fold_log_lines("making alt-arch migrators"):
-        add_arch_migrate(migrators, gx)
-
-    with fold_log_lines("making replacement migrators"):
-        add_replacement_migrator(
-            migrators,
-            gx,
-            "build",
-            "python-build",
-            "The conda package name 'build' is deprecated "
-            "and too generic. Use 'python-build instead.'",
-        )
-
-    pinning_migrators = []
-    with fold_log_lines("making pinning migrators"):
-        migration_factory(pinning_migrators, gx)
-
-    with fold_log_lines("making pinnings repo migrators"):
-        create_migration_yaml_creator(migrators=pinning_migrators, gx=gx)
-
-    with fold_log_lines("migration graph sizes"):
-        print("rebuild migration graph sizes:", flush=True)
-        for m in migrators + pinning_migrators:
-            if isinstance(m, GraphMigrator):
-                print(
-                    f'    {getattr(m, "name", m)} graph size: '
-                    f'{len(getattr(m, "graph", []))}',
-                    flush=True,
-                )
-        print(" ", flush=True)
-
-    with fold_log_lines("making version migrator"):
-        mctx = MigratorSessionContext(
-            circle_build_url=os.getenv("CIRCLE_BUILD_URL", ""),
-            graph=gx,
-            smithy_version=smithy_version,
-            pinning_version=pinning_version,
-            github_username=github_username,
-            github_password=github_password,
-            github_token=github_token,
-            dry_run=dry_run,
-        )
-
-        print("building package import maps and version migrator", flush=True)
-        python_nodes = {
-            n for n, v in mctx.graph.nodes("payload") if "python" in v.get("req", "")
-        }
-        python_nodes.update(
-            [
-                k
-                for node_name, node in mctx.graph.nodes("payload")
-                for k in node.get("outputs_names", [])
-                if node_name in python_nodes
-            ],
-        )
-        version_migrator = Version(
-            python_nodes=python_nodes,
-            pr_limit=PR_LIMIT * 4,
-            piggy_back_migrations=[
-                Jinja2VarsCleanup(),
-                DuplicateLinesCleanup(),
-                PipMigrator(),
-                LicenseMigrator(),
-                CondaForgeYAMLCleanup(),
-                ExtraJinja2KeysCleanup(),
-                Build2HostMigrator(),
-                NoCondaInspectMigrator(),
-                Cos7Config(),
-                PipWheelMigrator(),
-                MPIPinRunAsBuildCleanup(),
-                DependencyUpdateMigrator(python_nodes),
-            ],
-        )
-
-        random.shuffle(pinning_migrators)
-        migrators = [version_migrator] + migrators + pinning_migrators
-
-        print(" ", flush=True)
-
-    return mctx, temp, migrators
+    logger.info("Removing feedstock dir")
+    return migration_run_data["migrate_return_value"], ljpr
 
 
 def _compute_time_per_migrator(mctx, migrators):
     # we weight each migrator by the number of available nodes to migrate
     num_nodes = []
     for migrator in tqdm.tqdm(migrators, ncols=80, desc="computing time per migrator"):
-        mmctx = MigratorContext(session=mctx, migrator=migrator)
-        migrator.bind_to_ctx(mmctx)
-
         if isinstance(migrator, Version):
             _num_nodes = 0
-            for node_name in mmctx.effective_graph.nodes:
-                with mmctx.effective_graph.nodes[node_name]["payload"] as attrs:
+            for node_name in migrator.effective_graph.nodes:
+                with migrator.effective_graph.nodes[node_name]["payload"] as attrs:
                     with attrs["version_pr_info"] as vpri:
                         _attempts = vpri.get("new_version_attempts", {}).get(
                             vpri.get("new_version", ""),
@@ -1099,20 +505,17 @@ def _compute_time_per_migrator(mctx, migrators):
                         _num_nodes += 1
             _num_nodes = max(
                 _num_nodes,
-                min(PR_LIMIT * 4, len(mmctx.effective_graph.nodes)),
+                min(PR_LIMIT * 4, len(migrator.effective_graph.nodes)),
             )
             num_nodes.append(_num_nodes)
         else:
             num_nodes.append(
                 min(
                     getattr(migrator, "pr_limit", PR_LIMIT) * 4,
-                    len(mmctx.effective_graph.nodes),
+                    len(migrator.effective_graph.nodes),
                 ),
             )
 
-    sys.stderr.flush()
-    sys.stdout.flush()
-    print(" ", flush=True)
     num_nodes_tot = sum(num_nodes)
     # do not divide by zero
     time_per_node = float(os.environ.get("TIMEOUT", 600)) / max(num_nodes_tot, 1)
@@ -1142,12 +545,208 @@ def _compute_time_per_migrator(mctx, migrators):
     return num_nodes, time_per_migrator, tot_time_per_migrator
 
 
-def _run_migrator(migrator, mctx, temp, time_per, dry_run):
-    if hasattr(migrator, "name"):
-        assert isinstance(migrator.name, str)
-        migrator_name = migrator.name.lower().replace(" ", "")
+def _over_time_limit():
+    _now = time.time()
+    print(
+        """\
+
+=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>
+=~> elpased time %ds (timeout %ds)
+=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>=~>
+
+"""
+        % (_now - START_TIME, TIMEOUT),
+        flush=True,
+        end="",
+    )
+    return _now - START_TIME > TIMEOUT
+
+
+def _run_migrator_on_feedstock_branch(
+    attrs,
+    base_branch,
+    migrator,
+    fctx,
+    dry_run,
+    mctx,
+    migrator_name,
+    good_prs,
+):
+    break_loop = False
+    try:
+        try:
+            fctx.attrs["new_version"] = attrs.get("version_pr_info", {}).get(
+                "new_version", None
+            )
+            migrator_uid, pr_json = run_with_tmpdir(
+                context=fctx,
+                migrator=migrator,
+                rerender=migrator.rerender,
+                hash_type=attrs.get("hash_type", "sha256"),
+                base_branch=base_branch,
+                dry_run=dry_run,
+            )
+        finally:
+            fctx.attrs.pop("new_version", None)
+        # if migration successful
+        if migrator_uid:
+            with attrs["pr_info"] as pri:
+                d = frozen_to_json_friendly(migrator_uid)
+                # if we have the PR already do nothing
+                if d["data"] in [
+                    existing_pr["data"] for existing_pr in pri.get("PRed", [])
+                ]:
+                    pass
+                else:
+                    if not pr_json:
+                        pr_json = {
+                            "state": "closed",
+                            "head": {
+                                "ref": "<this_is_not_a_branch>",
+                            },
+                        }
+                    d["PR"] = pr_json
+                    if "PRed" not in pri:
+                        pri["PRed"] = []
+                    pri["PRed"].append(d)
+                pri.update(
+                    {
+                        "smithy_version": mctx.smithy_version,
+                        "pinning_version": mctx.pinning_version,
+                    },
+                )
+
+    except (github3.GitHubError, github.GithubException) as e:
+        if hasattr(e, "msg") and e.msg == "Repository was archived so is read-only.":
+            attrs["archived"] = True
+        else:
+            logger.critical(
+                "GITHUB ERROR ON FEEDSTOCK: %s",
+                fctx.feedstock_name,
+            )
+
+            if is_github_api_limit_reached():
+                logger.warning("GitHub API error", exc_info=e)
+                break_loop = True
+
+    except VersionMigrationError as e:
+        logger.exception("VERSION MIGRATION ERROR")
+
+        _set_pre_pr_migrator_error(
+            attrs,
+            migrator_name,
+            str(
+                e
+            ),  # we do not use any HTML formats here since at one point status page had them
+            is_version=isinstance(migrator, Version),
+        )
+
+    except URLError as e:
+        logger.exception("URLError ERROR")
+        with attrs["pr_info"] as pri:
+            pri["bad"] = {
+                "exception": str(e),
+                "traceback": str(traceback.format_exc()).split(
+                    "\n",
+                ),
+                "code": getattr(e, "code"),
+                "url": getattr(e, "url"),
+            }
+
+        _set_pre_pr_migrator_error(
+            attrs,
+            migrator_name,
+            sanitize_string(
+                "bot error (%s): %s: %s"
+                % (
+                    '<a href="' + get_bot_run_url() + '">bot CI job</a>',
+                    base_branch,
+                    str(traceback.format_exc()),
+                ),
+            ),
+            is_version=isinstance(migrator, Version),
+        )
+    except Exception as e:
+        logger.exception("NON GITHUB ERROR")
+
+        # we don't set bad for rerendering errors
+        if "conda smithy rerender -c auto --no-check-uptodate" not in str(e):
+            with attrs["pr_info"] as pri:
+                pri["bad"] = {
+                    "exception": str(e),
+                    "traceback": str(traceback.format_exc()).split(
+                        "\n",
+                    ),
+                }
+
+        if isinstance(e, ContainerRuntimeError):
+            _err_str = str(e)
+        else:
+            _err_str = str(traceback.format_exc())
+
+        _set_pre_pr_migrator_error(
+            attrs,
+            migrator_name,
+            sanitize_string(
+                "bot error (%s): %s:\n%s"
+                % (
+                    '<a href="' + get_bot_run_url() + '">bot CI job</a>',
+                    base_branch,
+                    _err_str,
+                ),
+            ),
+            is_version=isinstance(migrator, Version),
+        )
     else:
-        migrator_name = migrator.__class__.__name__.lower()
+        if migrator_uid:
+            # On successful PR add to our counter
+            good_prs += 1
+
+    return good_prs, break_loop
+
+
+def _is_migrator_done(_mg_start, good_prs, time_per, pr_limit):
+    curr_time = time.time()
+    backend = github_backend()
+    api_req = backend.get_api_requests_left()
+
+    if curr_time - START_TIME > TIMEOUT:
+        logger.info(
+            "BOT TIMEOUT: breaking after %d seconds (limit %d)",
+            curr_time - START_TIME,
+            TIMEOUT,
+        )
+        return True
+
+    if good_prs >= pr_limit:
+        logger.info(
+            "MIGRATOR PR LIMIT: breaking after %d good PRs (limit %d)",
+            good_prs,
+            pr_limit,
+        )
+        return True
+
+    if (curr_time - _mg_start) > time_per:
+        logger.info(
+            "TIME LIMIT: breaking after %d seconds (limit %d)",
+            curr_time - _mg_start,
+            time_per,
+        )
+        return True
+
+    if api_req == 0:
+        logger.info(
+            "GitHub API LIMIT: no requests left",
+        )
+        return True
+
+    return False
+
+
+def _run_migrator(migrator, mctx, temp, time_per, dry_run):
+    _mg_start = time.time()
+
+    migrator_name = get_migrator_name(migrator)
 
     if hasattr(migrator, "name"):
         extra_name = "-%s" % migrator.name
@@ -1161,22 +760,8 @@ def _run_migrator(migrator, mctx, temp, time_per, dry_run):
             extra_name,
         ),
     ):
-
-        print(
-            "\n========================================"
-            "========================================"
-            "\n"
-            "========================================"
-            "========================================",
-            flush=True,
-        )
-
-        mmctx = MigratorContext(session=mctx, migrator=migrator)
-        migrator.bind_to_ctx(mmctx)
-
         good_prs = 0
-        _mg_start = time.time()
-        effective_graph = mmctx.effective_graph
+        effective_graph = migrator.effective_graph
 
         possible_nodes = list(migrator.order(effective_graph, mctx.graph))
 
@@ -1203,204 +788,112 @@ def _run_migrator(migrator, mctx, temp, time_per, dry_run):
                         )
 
         print(
-            "Running migrations for %s%s: %d\n"
+            "found %d nodes for migration %s%s"
             % (
+                len(effective_graph.nodes),
                 migrator.__class__.__name__,
                 extra_name,
-                len(effective_graph.nodes),
             ),
             flush=True,
         )
 
-        for node_name in possible_nodes:
-            with mctx.graph.nodes[node_name]["payload"] as attrs:
-                # Don't let CI timeout, break ahead of the timeout so we make certain
-                # to write to the repo
-                # TODO: convert these env vars
-                _now = time.time()
-                if (
-                    (
-                        _now - int(os.environ.get("START_TIME", time.time()))
-                        > int(os.environ.get("TIMEOUT", 600))
-                    )
-                    or good_prs >= migrator.pr_limit
-                    or (_now - _mg_start) > time_per
-                ):
-                    break
+        if _is_migrator_done(_mg_start, good_prs, time_per, migrator.pr_limit):
+            return 0
 
-                base_branches = migrator.get_possible_feedstock_branches(attrs)
-                if "branch" in attrs:
-                    has_attrs_branch = True
-                    orig_branch = attrs.get("branch")
-                else:
-                    has_attrs_branch = False
-                    orig_branch = None
-
-                fctx = FeedstockContext(
-                    package_name=node_name,
-                    feedstock_name=attrs["feedstock_name"],
-                    attrs=attrs,
+    for node_name in possible_nodes:
+        with (
+            fold_log_lines(
+                "%s%s IS MIGRATING %s"
+                % (
+                    migrator.__class__.__name__.upper(),
+                    extra_name,
+                    node_name,
                 )
+            ),
+            mctx.graph.nodes[node_name]["payload"] as attrs,
+        ):
+            # Don't let CI timeout, break ahead of the timeout so we make certain
+            # to write to the repo
+            if _is_migrator_done(_mg_start, good_prs, time_per, migrator.pr_limit):
+                break
 
-                # map main to current default branch
-                base_branches = [
-                    br if br != "main" else fctx.default_branch for br in base_branches
-                ]
+            base_branches = migrator.get_possible_feedstock_branches(attrs)
+            if "branch" in attrs:
+                has_attrs_branch = True
+                orig_branch = attrs.get("branch")
+            else:
+                has_attrs_branch = False
+                orig_branch = None
 
-                try:
-                    for base_branch in base_branches:
-                        attrs["branch"] = base_branch
-                        if migrator.filter(attrs):
-                            continue
+            fctx = FeedstockContext(
+                feedstock_name=attrs["feedstock_name"],
+                attrs=attrs,
+            )
 
-                        print("\n", flush=True, end="")
-                        sys.stderr.flush()
-                        sys.stdout.flush()
-                        LOGGER.info(
-                            "%s%s IS MIGRATING %s:%s",
+            # map main to current default branch
+            base_branches = [
+                br if br != "main" else fctx.default_branch for br in base_branches
+            ]
+
+            try:
+                for base_branch in base_branches:
+                    # skip things that do not get migrated
+                    attrs["branch"] = base_branch
+                    if migrator.filter(attrs):
+                        if (
+                            logging.getLogger("conda_forge_tick").getEffectiveLevel()
+                            > logging.DEBUG
+                        ):
+                            with change_log_level("conda_forge_tick", "DEBUG"):
+                                migrator.filter(attrs)
+                        logger.info(
+                            "skipping node %s w/ branch %s", node_name, base_branch
+                        )
+                        continue
+
+                    with fold_log_lines(
+                        "%s%s IS MIGRATING %s:%s"
+                        % (
                             migrator.__class__.__name__.upper(),
                             extra_name,
-                            fctx.package_name,
+                            fctx.feedstock_name,
                             base_branch,
                         )
-                        try:
-                            # Don't bother running if we are at zero
-                            if mctx.gh_api_requests_left == 0:
-                                break
-                            migrator_uid, pr_json = run(
-                                feedstock_ctx=fctx,
-                                migrator=migrator,
-                                rerender=migrator.rerender,
-                                protocol="https",
-                                hash_type=attrs.get("hash_type", "sha256"),
-                                base_branch=base_branch,
-                            )
-                            # if migration successful
-                            if migrator_uid:
-                                with attrs["pr_info"] as pri:
-                                    d = frozen_to_json_friendly(migrator_uid)
-                                    # if we have the PR already do nothing
-                                    if d["data"] in [
-                                        existing_pr["data"]
-                                        for existing_pr in pri.get("PRed", [])
-                                    ]:
-                                        pass
-                                    else:
-                                        if not pr_json:
-                                            pr_json = {
-                                                "state": "closed",
-                                                "head": {
-                                                    "ref": "<this_is_not_a_branch>",
-                                                },
-                                            }
-                                        d["PR"] = pr_json
-                                        if "PRed" not in pri:
-                                            pri["PRed"] = []
-                                        pri["PRed"].append(d)
-                                    pri.update(
-                                        {
-                                            "smithy_version": mctx.smithy_version,
-                                            "pinning_version": mctx.pinning_version,
-                                        },
-                                    )
+                    ):
+                        good_prs, break_loop = _run_migrator_on_feedstock_branch(
+                            attrs,
+                            base_branch,
+                            migrator,
+                            fctx,
+                            dry_run,
+                            mctx,
+                            migrator_name,
+                            good_prs,
+                        )
+                        if break_loop:
+                            break
+            finally:
+                # reset branch
+                if has_attrs_branch:
+                    attrs["branch"] = orig_branch
 
-                        except github3.GitHubError as e:
-                            if e.msg == "Repository was archived so is read-only.":
-                                attrs["archived"] = True
-                            else:
-                                LOGGER.critical(
-                                    "GITHUB ERROR ON FEEDSTOCK: %s",
-                                    fctx.feedstock_name,
-                                )
-                                if is_github_api_limit_reached(e, mctx.gh):
-                                    break
-                        except URLError as e:
-                            LOGGER.exception("URLError ERROR")
-                            with attrs["pr_info"] as pri:
-                                pri["bad"] = {
-                                    "exception": str(e),
-                                    "traceback": str(traceback.format_exc()).split(
-                                        "\n",
-                                    ),
-                                    "code": getattr(e, "code"),
-                                    "url": getattr(e, "url"),
-                                }
+                # do this but it is crazy
+                gc.collect()
 
-                            _set_pre_pr_migrator_fields(
-                                attrs,
-                                migrator_name,
-                                sanitize_string(
-                                    "bot error (%s): %s: %s"
-                                    % (
-                                        '<a href="'
-                                        + os.getenv("CIRCLE_BUILD_URL", "")
-                                        + '">bot CI job</a>',
-                                        base_branch,
-                                        str(traceback.format_exc()),
-                                    ),
-                                ),
-                            )
-                        except Exception as e:
-                            LOGGER.exception("NON GITHUB ERROR")
-                            # we don't set bad for rerendering errors
-                            if (
-                                "conda smithy rerender -c auto --no-check-uptodate"
-                                not in str(e)
-                            ):
-                                with attrs["pr_info"] as pri:
-                                    pri["bad"] = {
-                                        "exception": str(e),
-                                        "traceback": str(traceback.format_exc()).split(
-                                            "\n",
-                                        ),
-                                    }
+                # sometimes we get weird directory issues so make sure we reset
+                os.chdir(BOT_HOME_DIR)
 
-                            _set_pre_pr_migrator_fields(
-                                attrs,
-                                migrator_name,
-                                sanitize_string(
-                                    "bot error (%s): %s: %s"
-                                    % (
-                                        '<a href="'
-                                        + os.getenv("CIRCLE_BUILD_URL", "")
-                                        + '">bot CI job</a>',
-                                        base_branch,
-                                        str(traceback.format_exc()),
-                                    ),
-                                ),
-                            )
-                        else:
-                            if migrator_uid:
-                                # On successful PR add to our counter
-                                good_prs += 1
-                finally:
-                    # reset branch
-                    if has_attrs_branch:
-                        attrs["branch"] = orig_branch
+                # Write graph partially through
+                if not dry_run:
+                    dump_graph(mctx.graph)
 
-                    # do this but it is crazy
-                    gc.collect()
-
-                    # sometimes we get weird directory issues so make sure we reset
-                    os.chdir(BOT_HOME_DIR)
-
-                    # Write graph partially through
-                    if not dry_run:
-                        dump_graph(mctx.graph)
-
-                    eval_cmd(f"rm -rf {mctx.rever_dir}/*")
-                    LOGGER.info(os.getcwd())
+                with filter_reprinted_lines("rm-tmp"):
                     for f in glob.glob("/tmp/*"):
                         if f not in temp:
                             try:
-                                eval_cmd(f"rm -rf {f}")
+                                eval_cmd(["rm", "-rf", f])
                             except Exception:
                                 pass
-
-                if mctx.gh_api_requests_left == 0:
-                    break
-
-        print("\n", flush=True)
 
     return good_prs
 
@@ -1412,18 +905,18 @@ def _setup_limits():
         limit_gb = float(os.environ["MEMORY_LIMIT_GB"])
         limit = limit_gb * 1e9
         limit_int = int(int(limit) * 0.95)
-        print(f"limit read as {limit/1e9} GB")
-        print(f"Setting memory limit to {limit_int//1e9} GB")
+        print(f"limit read as {limit / 1e9} GB")
+        print(f"Setting memory limit to {limit_int // 1e9} GB")
         resource.setrlimit(resource.RLIMIT_AS, (limit_int, limit_int))
 
 
-def _update_nodes_with_bot_rerun(gx):
+def _update_nodes_with_bot_rerun(gx: nx.DiGraph):
     """Go through all the open PRs and check if they are rerun"""
 
     print("processing bot-rerun labels", flush=True)
 
     for i, (name, node) in enumerate(gx.nodes.items()):
-        # LOGGER.info(
+        # logger.info(
         #     f"node: {i} memory usage: "
         #     f"{psutil.Process().memory_info().rss // 1024 ** 2}MB",
         # )
@@ -1441,7 +934,7 @@ def _update_nodes_with_bot_rerun(gx):
                             pr_json = migration.get("PR", {})
                             # maybe add a pass check info here ? (if using DEBUG)
                         except Exception as e:
-                            LOGGER.error(
+                            logger.error(
                                 f"BOT-RERUN : could not proceed check with {node}, {e}",
                             )
                             raise e
@@ -1454,7 +947,7 @@ def _update_nodes_with_bot_rerun(gx):
                             in [lb["name"] for lb in pr_json.get("labels", [])]
                         ):
                             migration["data"]["bot_rerun"] = time.time()
-                            LOGGER.info(
+                            logger.info(
                                 "BOT-RERUN %s: processing bot rerun label "
                                 "for migration %s",
                                 name,
@@ -1463,11 +956,11 @@ def _update_nodes_with_bot_rerun(gx):
 
 
 def _filter_ignored_versions(attrs, version):
-    versions_to_ignore = (
-        attrs.get("conda-forge.yml", {})
-        .get("bot", {})
-        .get("version_updates", {})
-        .get("exclude", [])
+    versions_to_ignore = get_keys_default(
+        attrs,
+        ["conda-forge.yml", "bot", "version_updates", "exclude"],
+        {},
+        [],
     )
     if (
         str(version).replace("-", ".") in versions_to_ignore
@@ -1560,41 +1053,41 @@ def _remove_closed_pr_json():
 
 def _update_graph_with_pr_info():
     _remove_closed_pr_json()
-    gx = load_graph()
+    gx = load_existing_graph()
     _update_nodes_with_bot_rerun(gx)
     _update_nodes_with_new_versions(gx)
     dump_graph(gx)
 
 
-# @profiling
-def main(args: "CLIArgs") -> None:
+def main(ctx: CliContext) -> None:
+    global START_TIME
+    START_TIME = time.time()
+
     _setup_limits()
-
-    global BOT_HOME_DIR
-    BOT_HOME_DIR = os.getcwd()
-
-    # logging
-    if args.debug:
-        setup_logger(logging.getLogger("conda_forge_tick"), level="debug")
-    else:
-        setup_logger(logging.getLogger("conda_forge_tick"))
 
     with fold_log_lines("updating graph with PR info"):
         _update_graph_with_pr_info()
+        deploy(ctx, dirs_to_deploy=["version_pr_info", "pr_json", "pr_info"])
 
-    from . import sensitive_env
+    # record tmp dir so we can be sure to clean it later
+    temp = glob.glob("/tmp/*")
 
-    with sensitive_env() as env:
-        github_username = env.get("USERNAME", "")
-        github_password = env.get("PASSWORD", "")
-        github_token = env.get("GITHUB_TOKEN")
-
-    mctx, temp, migrators = initialize_migrators(
-        github_username=github_username,
-        github_password=github_password,
-        dry_run=args.dry_run,
-        github_token=github_token,
-    )
+    with fold_log_lines("loading graph and migrators"):
+        gx = load_existing_graph()
+        smithy_version: str = eval_cmd(["conda", "smithy", "--version"]).strip()
+        pinning_version: str = cast(
+            str,
+            json.loads(eval_cmd(["conda", "list", "conda-forge-pinning", "--json"]))[0][
+                "version"
+            ],
+        )
+        mctx = MigratorSessionContext(
+            graph=gx,
+            smithy_version=smithy_version,
+            pinning_version=pinning_version,
+            dry_run=ctx.dry_run,
+        )
+        migrators = load_migrators()
 
     # compute the time per migrator
     with fold_log_lines("computing migrator run times"):
@@ -1631,17 +1124,20 @@ def main(args: "CLIArgs") -> None:
             mctx,
             temp,
             time_per_migrator[mg_ind],
-            args.dry_run,
+            ctx.dry_run,
         )
         if good_prs > 0:
             pass
             # this has been causing issues with bad deploys
             # turning off for now
-            # deploy(dry_run=args.dry_run)
+            # deploy(
+            #     ctx,
+            #     dirs_to_deploy=[
+            #         "pr_json",
+            #         "pr_info",
+            #         "version_pr_info",
+            #     ],
+            # )
 
-    LOGGER.info("API Calls Remaining: %d", mctx.gh_api_requests_left)
-    LOGGER.info("Done")
-
-
-if __name__ == "__main__":
-    pass  # main()
+    logger.info("API Calls Remaining: %d", github_backend().get_api_requests_left())
+    logger.info("Done")

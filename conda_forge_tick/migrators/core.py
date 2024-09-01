@@ -1,41 +1,56 @@
-"""Classes for migrating repos"""
-import os
-import re
-import dateutil.parser
+"""Base classes for migrating repos"""
+
+import copy
 import datetime
-from itertools import chain
-import typing
 import logging
-from typing import (
-    List,
-    Any,
-    Optional,
-    Sequence,
-    Set,
-)
+import re
+import typing
+from typing import Any, List, Sequence, Set
 
-
+import dateutil.parser
 import networkx as nx
 
-from conda_forge_tick.path_lengths import cyclic_topological_sort
+from conda_forge_tick.contexts import ClonedFeedstockContext, FeedstockContext
 from conda_forge_tick.lazy_json_backends import LazyJson
+from conda_forge_tick.make_graph import make_outputs_lut_from_graph
+from conda_forge_tick.path_lengths import cyclic_topological_sort
+from conda_forge_tick.update_recipe import update_build_number
 from conda_forge_tick.utils import (
     frozen_to_json_friendly,
+    get_bot_run_url,
+    get_keys_default,
 )
-from conda_forge_tick.make_graph import make_outputs_lut_from_graph
-from conda_forge_tick.contexts import MigratorContext, FeedstockContext
-from conda_forge_tick.update_recipe import update_build_number
 
 if typing.TYPE_CHECKING:
-    from ..migrators_types import (
-        AttrsTypedDict,
-        MigrationUidTypedDict,
-        PackageName,
-    )
     from conda_forge_tick.utils import JsonFriendly
 
+    from ..migrators_types import AttrsTypedDict, MigrationUidTypedDict, PackageName
 
-LOGGER = logging.getLogger("conda_forge_tick.migrators.core")
+
+logger = logging.getLogger(__name__)
+
+
+def _make_effective_graph(graph, migrator):
+    """Prune graph only to nodes that need rebuilds."""
+    gx2 = copy.deepcopy(graph)
+
+    # Prune graph to only things that need builds right now
+    for node in list(gx2.nodes):
+        if isinstance(graph.nodes[node]["payload"], LazyJson):
+            with graph.nodes[node]["payload"] as _attrs:
+                attrs = copy.deepcopy(_attrs.data)
+        else:
+            attrs = copy.deepcopy(graph.nodes[node]["payload"])
+        base_branches = migrator.get_possible_feedstock_branches(attrs)
+        filters = []
+        for base_branch in base_branches:
+            attrs["branch"] = base_branch
+            filters.append(migrator.filter(attrs))
+
+        if filters and all(filters):
+            gx2.remove_node(node)
+
+    return gx2
 
 
 def _sanitized_muids(pred: List[dict]) -> List["JsonFriendly"]:
@@ -73,8 +88,67 @@ def _gen_active_feedstocks_payloads(nodes, gx):
             yield node, payload
 
 
+def _migratror_hash(klass, args, kwargs):
+    import hashlib
+
+    from conda_forge_tick.lazy_json_backends import dumps
+
+    data = {
+        "class": klass,
+        "args": args,
+        "kwargs": kwargs,
+    }
+
+    return hashlib.sha1(dumps(data).encode("utf-8")).hexdigest()
+
+
+def _make_migrator_lazy_json_name(mgr, data):
+    return (
+        mgr.name
+        if hasattr(mgr, "name")
+        else mgr.__class__.__name__
+        + (
+            ""
+            if len(mgr._init_args) == 0 and len(mgr._init_kwargs) == 0
+            else "_h"
+            + _migratror_hash(
+                data["class"],
+                data["args"],
+                data["kwargs"],
+            )
+        )
+    ).replace(" ", "_")
+
+
+def make_from_lazy_json_data(data):
+    """Deserialize the migrator from LazyJson-compatible data."""
+    import conda_forge_tick.migrators
+
+    cls = getattr(conda_forge_tick.migrators, data["class"])
+
+    kwargs = copy.deepcopy(data["kwargs"])
+    if (
+        "piggy_back_migrations" in kwargs
+        and kwargs["piggy_back_migrations"]
+        and isinstance(kwargs["piggy_back_migrations"][0], dict)
+    ):
+        kwargs["piggy_back_migrations"] = [
+            make_from_lazy_json_data(mini_migrator)
+            for mini_migrator in kwargs["piggy_back_migrations"]
+        ]
+
+    return cls(*data["args"], **kwargs)
+
+
 class MiniMigrator:
     post_migration = False
+
+    def __init__(self):
+        if not hasattr(self, "_init_args"):
+            self._init_args = []
+
+        if not hasattr(self, "_init_kwargs"):
+            self._init_kwargs = {}
 
     def filter(self, attrs: "AttrsTypedDict", not_bad_str_start: str = "") -> bool:
         """If true don't act upon node
@@ -108,9 +182,22 @@ class MiniMigrator:
         """
         return
 
+    def to_lazy_json_data(self):
+        """Serialize the migrator to LazyJson-compatible data."""
+        data = {
+            "__mini_migrator__": True,
+            "class": self.__class__.__name__,
+            "args": self._init_args,
+            "kwargs": self._init_kwargs,
+        }
+        data["name"] = _make_migrator_lazy_json_name(self, data)
+        return data
+
 
 class Migrator:
     """Base class for Migrators"""
+
+    name: str
 
     rerender = True
 
@@ -135,18 +222,76 @@ class Migrator:
         self,
         pr_limit: int = 0,
         # TODO: Validate this?
-        obj_version: Optional[int] = None,
-        piggy_back_migrations: Optional[Sequence[MiniMigrator]] = None,
-        check_solvable=True,
+        obj_version: int | None = None,
+        piggy_back_migrations: Sequence[MiniMigrator] | None = None,
+        check_solvable: bool = True,
+        graph: nx.DiGraph | None = None,
+        effective_graph: nx.DiGraph | None = None,
     ):
+        if not hasattr(self, "_init_args"):
+            self._init_args = []
+
+        if not hasattr(self, "_init_kwargs"):
+            self._init_kwargs = {
+                "pr_limit": pr_limit,
+                "obj_version": obj_version,
+                "piggy_back_migrations": piggy_back_migrations,
+                "check_solvable": check_solvable,
+                "graph": graph,
+                "effective_graph": effective_graph,
+            }
+
         self.piggy_back_migrations = piggy_back_migrations or []
-        self.pr_limit = pr_limit
+        self._pr_limit = pr_limit
         self.obj_version = obj_version
-        self.ctx: MigratorContext = None
         self.check_solvable = check_solvable
 
-    def bind_to_ctx(self, migrator_ctx: MigratorContext) -> None:
-        self.ctx = migrator_ctx
+        if graph is None:
+            self.graph = nx.DiGraph()
+        else:
+            self.graph = graph
+
+        self.effective_graph = effective_graph
+
+    def to_lazy_json_data(self):
+        """Serialize the migrator to LazyJson-compatible data."""
+
+        kwargs = copy.deepcopy(self._init_kwargs)
+        if (
+            "piggy_back_migrations" in kwargs
+            and kwargs["piggy_back_migrations"]
+            and isinstance(kwargs["piggy_back_migrations"][0], MiniMigrator)
+        ):
+            kwargs["piggy_back_migrations"] = [
+                mini_migrator.to_lazy_json_data()
+                for mini_migrator in kwargs["piggy_back_migrations"]
+            ]
+
+        data = {
+            "__migrator__": True,
+            "class": self.__class__.__name__,
+            "args": self._init_args,
+            "kwargs": kwargs,
+        }
+        data["name"] = _make_migrator_lazy_json_name(self, data)
+        return data
+
+    def _reset_effective_graph(self, force=False):
+        """This method is meant to be called by an non-abstract child class at the end
+        of its __init__ method."""
+        if self.effective_graph is None or force:
+            self.effective_graph = _make_effective_graph(self.graph, self)
+            self._init_kwargs["effective_graph"] = self.effective_graph
+
+    @property
+    def pr_limit(self):
+        return self._pr_limit
+
+    @pr_limit.setter
+    def pr_limit(self, value):
+        self._pr_limit = value
+        if hasattr(self, "_init_kwargs"):
+            self._init_kwargs["pr_limit"] = value
 
     def downstream_children(
         self,
@@ -157,7 +302,7 @@ class Migrator:
         return [
             a[1]
             for a in list(
-                self.ctx.effective_graph.out_edges(feedstock_ctx.package_name),
+                self.effective_graph.out_edges(feedstock_ctx.feedstock_name),
             )
         ][:limit]
 
@@ -196,7 +341,7 @@ class Migrator:
             already_pred = migrator_uid in already_migrated_uids
             if already_pred:
                 ind = already_migrated_uids.index(migrator_uid)
-                LOGGER.debug(f"{__name}: already PRed: uid: {migrator_uid}")
+                logger.debug(f"{__name}: already PRed: uid: {migrator_uid}")
                 if "PR" in attrs.get("pr_info", {}).get("PRed", [])[ind]:
                     if isinstance(
                         attrs.get("pr_info", {}).get("PRed", [])[ind]["PR"],
@@ -205,24 +350,24 @@ class Migrator:
                         with attrs.get("pr_info", {}).get("PRed", [])[ind][
                             "PR"
                         ] as mg_attrs:
-
-                            LOGGER.debug(
-                                "%s: already PRed: PR file: %s"
-                                % (__name, mg_attrs.file_name),
+                            logger.debug(
+                                "{}: already PRed: PR file: {}".format(
+                                    __name, mg_attrs.file_name
+                                ),
                             )
 
                             html_url = mg_attrs.get("html_url", "no url")
 
-                            LOGGER.debug(f"{__name}: already PRed: url: {html_url}")
+                            logger.debug(f"{__name}: already PRed: url: {html_url}")
 
             return already_pred
 
         if attrs.get("archived", False):
-            LOGGER.debug("%s: archived" % __name)
+            logger.debug("%s: archived" % __name)
 
         bad_attr = _parse_bad_attr(attrs, not_bad_str_start)
         if bad_attr:
-            LOGGER.debug("%s: bad attr" % __name)
+            logger.debug("%s: bad attr - %s", __name, bad_attr)
 
         return attrs.get("archived", False) or parse_already_pred() or bad_attr
 
@@ -242,13 +387,14 @@ class Migrator:
         """
         branches = ["main"]
         try:
-            branches += (
-                attrs.get("conda-forge.yml", {})
-                .get("bot", {})
-                .get("abi_migration_branches", [])
+            branches += get_keys_default(
+                attrs,
+                ["conda-forge.yml", "bot", "abi_migration_branches"],
+                {},
+                [],
             )
         except Exception:
-            LOGGER.exception(f"Invalid value for {attrs.get('conda-forge.yml', {})=}")
+            logger.exception(f"Invalid value for {attrs.get('conda-forge.yml', {})=}")
         # make sure this is always a string
         return [str(b) for b in branches]
 
@@ -309,7 +455,9 @@ class Migrator:
         """
         return self.migrator_uid(attrs)
 
-    def pr_body(self, feedstock_ctx: FeedstockContext, add_label_text=True) -> str:
+    def pr_body(
+        self, feedstock_ctx: ClonedFeedstockContext, add_label_text=True
+    ) -> str:
         """Create a PR message body
 
         Returns
@@ -332,13 +480,13 @@ class Migrator:
 
         body += (
             "<sub>"
-            "This PR was created by the [regro-cf-autotick-bot](https://github.com/regro/cf-scripts). "  # noqa
+            "This PR was created by the [regro-cf-autotick-bot](https://github.com/regro/cf-scripts). "
             "The **regro-cf-autotick-bot** is a service to automatically "
             "track the dependency graph, migrate packages, and "
             "propose package version updates for conda-forge. "
             "Feel free to drop us a line if there are any "
             "[issues](https://github.com/regro/cf-scripts/issues)! "
-            + f"This PR was generated by {self.ctx.session.circle_build_url}, please use this URL for debugging."  # noqa
+            + f"This PR was generated by {get_bot_run_url()} - please use this URL for debugging."
             + "</sub>"
         )
         return body
@@ -463,27 +611,42 @@ class GraphMigrator(Migrator):
     def __init__(
         self,
         *,
-        name: Optional[str] = None,
-        graph: nx.DiGraph = None,
+        name: str | None = None,
+        graph: nx.DiGraph | None = None,
         pr_limit: int = 0,
-        top_level: Set["PackageName"] = None,
-        cycles: Optional[Sequence["PackageName"]] = None,
-        obj_version: Optional[int] = None,
-        piggy_back_migrations: Optional[Sequence[MiniMigrator]] = None,
-        check_solvable=True,
+        top_level: Set["PackageName"] | None = None,
+        cycles: Sequence["PackageName"] | None = None,
+        obj_version: int | None = None,
+        piggy_back_migrations: Sequence[MiniMigrator] | None = None,
+        check_solvable: bool = True,
         ignored_deps_per_node=None,
+        effective_graph: nx.DiGraph | None = None,
     ):
+        if not hasattr(self, "_init_args"):
+            self._init_args = []
+
+        if not hasattr(self, "_init_kwargs"):
+            self._init_kwargs = {
+                "name": name,
+                "graph": graph,
+                "pr_limit": pr_limit,
+                "top_level": top_level,
+                "cycles": cycles,
+                "obj_version": obj_version,
+                "piggy_back_migrations": piggy_back_migrations,
+                "check_solvable": check_solvable,
+                "ignored_deps_per_node": ignored_deps_per_node,
+                "effective_graph": effective_graph,
+            }
+
         super().__init__(
             pr_limit,
             obj_version,
             piggy_back_migrations,
             check_solvable=check_solvable,
+            graph=graph,
+            effective_graph=effective_graph,
         )
-        # TODO: Grab the graph from the migrator ctx
-        if graph is None:
-            self.graph = nx.DiGraph()
-        else:
-            self.graph = graph
 
         # IDK if this will be there so I am going to make it if needed
         if "outputs_lut" in self.graph.graph:
@@ -493,7 +656,7 @@ class GraphMigrator(Migrator):
 
         self.name = name
         self.top_level = top_level or set()
-        self.cycles = set(chain.from_iterable(cycles or []))
+        self.cycles = set(cycles or [])
         self.ignored_deps_per_node = ignored_deps_per_node or {}
 
     def all_predecessors_issued_and_stale(self, attrs: "AttrsTypedDict") -> bool:
@@ -511,7 +674,7 @@ class GraphMigrator(Migrator):
             muid = frozen_to_json_friendly(self.migrator_uid(payload))
             pr_muids = _sanitized_muids(payload.get("pr_info", {}).get("PRed", []))
             if muid not in pr_muids:
-                LOGGER.debug(
+                logger.debug(
                     "node %s PR %s not yet issued!",
                     node,
                     muid.get("data", {}).get("name", None),
@@ -538,7 +701,7 @@ class GraphMigrator(Migrator):
                         now = datetime.datetime.now(datetime.timezone.utc)
                         ts = dateutil.parser.parse(ts)
                         if now - ts < datetime.timedelta(days=14):
-                            LOGGER.debug(
+                            logger.debug(
                                 "node %s has PR %s open for %s",
                                 node,
                                 muid.get("data", {}).get("name", None),
@@ -547,7 +710,7 @@ class GraphMigrator(Migrator):
                             return False
                     else:
                         # no timestamp so keep things open
-                        LOGGER.debug(
+                        logger.debug(
                             "node %s has PR %s:%s with no timestamp",
                             node,
                             muid.get("data", {}).get("name", None),
@@ -565,7 +728,6 @@ class GraphMigrator(Migrator):
             self.graph.predecessors(attrs["feedstock_name"]),
             self.graph,
         ):
-
             if node in self.ignored_deps_per_node.get(
                 attrs.get("feedstock_name", None),
                 [],
@@ -577,7 +739,7 @@ class GraphMigrator(Migrator):
             if muid not in _sanitized_muids(
                 payload.get("pr_info", {}).get("PRed", []),
             ):
-                LOGGER.debug("not yet built: %s" % node)
+                logger.debug("not yet built: %s" % node)
                 return True
 
             # This is due to some PRed_json loss due to bad graph deploy outage
@@ -593,7 +755,7 @@ class GraphMigrator(Migrator):
                 m_pred_json
                 and m_pred_json.get("PR", {"state": "open"}).get("state", "") == "open"
             ):
-                LOGGER.debug("not yet built: %s" % node)
+                logger.debug("not yet built: %s" % node)
                 return True
 
         return False
@@ -602,11 +764,11 @@ class GraphMigrator(Migrator):
         name = attrs.get("name", "")
 
         if super().filter(attrs, "Upstream:"):
-            LOGGER.debug("filter %s: archived or done", name)
+            logger.debug("filter %s: archived or done", name)
             return True
 
         if attrs.get("feedstock_name", None) not in self.graph:
-            LOGGER.debug("filter %s: node not in graph", name)
+            logger.debug("filter %s: node not in graph", name)
             return True
 
         # If in top level or in a cycle don't check for upstreams just build
@@ -619,138 +781,15 @@ class GraphMigrator(Migrator):
         if name == "conda-forge-pinning" and self.all_predecessors_issued_and_stale(
             attrs=attrs,
         ):
-            LOGGER.debug("not filtered %s: pinning parents issued and stale", name)
+            logger.debug("not filtered %s: pinning parents issued and stale", name)
             return False
 
         # Check if all upstreams have been built
         if self.predecessors_not_yet_built(attrs=attrs):
-            LOGGER.debug("filter %s: parents not built", name)
+            logger.debug("filter %s: parents not built", name)
             return True
 
         return False
-
-    def migrator_uid(self, attrs: "AttrsTypedDict") -> "MigrationUidTypedDict":
-        n = super().migrator_uid(attrs)
-        n["name"] = self.name
-        return n
-
-
-class Replacement(Migrator):
-    """Migrator for replacing one package with another.
-
-    Parameters
-    ----------
-    old_pkg : str
-        The package to be replaced.
-    new_pkg : str
-        The package to replace the `old_pkg`.
-    rationale : str
-        The reason the for the migration. Should be a full statement.
-    graph : nx.DiGraph, optional
-        The graph of feedstocks.
-    pr_limit : int, optional
-        The maximum number of PRs made per run of the bot.
-    check_solvable : bool, optional
-        If True, uses mamba to check if the final recipe is solvable.
-    """
-
-    migrator_version = 0
-    rerender = True
-
-    def __init__(
-        self,
-        *,
-        old_pkg: "PackageName",
-        new_pkg: "PackageName",
-        rationale: str,
-        graph: nx.DiGraph = None,
-        pr_limit: int = 0,
-        check_solvable=True,
-    ):
-        super().__init__(pr_limit, check_solvable=check_solvable)
-        self.old_pkg = old_pkg
-        self.new_pkg = new_pkg
-        self.pattern = re.compile(r"\s*-\s*(%s)(\s+|$)" % old_pkg)
-        self.packages = {old_pkg}
-        self.rationale = rationale
-        self.name = f"{old_pkg}-to-{new_pkg}"
-        if graph is None:
-            self.graph = nx.DiGraph()
-        else:
-            self.graph = graph
-
-    def order(
-        self,
-        graph: nx.DiGraph,
-        total_graph: nx.DiGraph,
-    ) -> Sequence["PackageName"]:
-        """Order to run migrations in
-
-        Parameters
-        ----------
-        graph : nx.DiGraph
-            The graph of migratable PRs
-
-        Returns
-        -------
-        graph : nx.DiGraph
-            The ordered graph.
-        """
-        return graph
-
-    def filter(self, attrs: "AttrsTypedDict", not_bad_str_start: str = "") -> bool:
-        requirements = attrs.get("requirements", {})
-        rq = (
-            requirements.get("build", set())
-            | requirements.get("host", set())
-            | requirements.get("run", set())
-            | requirements.get("test", set())
-        )
-        return super().filter(attrs) or len(rq & self.packages) == 0
-
-    def migrate(
-        self, recipe_dir: str, attrs: "AttrsTypedDict", **kwargs: Any
-    ) -> "MigrationUidTypedDict":
-        with open(os.path.join(recipe_dir, "meta.yaml")) as f:
-            raw = f.read()
-        lines = raw.splitlines()
-        n = False
-        for i, line in enumerate(lines):
-            m = self.pattern.match(line)
-            if m is not None:
-                lines[i] = lines[i].replace(m.group(1), self.new_pkg)
-                n = True
-        if not n:
-            return False
-        upd = "\n".join(lines) + "\n"
-        with open(os.path.join(recipe_dir, "meta.yaml"), "w") as f:
-            f.write(upd)
-        self.set_build_number(os.path.join(recipe_dir, "meta.yaml"))
-        return super().migrate(recipe_dir, attrs)
-
-    def pr_body(self, feedstock_ctx: FeedstockContext) -> str:
-        body = super().pr_body(feedstock_ctx)
-        body = body.format(
-            "I noticed that this recipe depends on `%s` instead of \n"
-            "`%s`. %s \n"
-            "This PR makes this change."
-            "\n"
-            "Notes and instructions for merging this PR:\n"
-            "1. Make sure that the recipe can indeed only depend on `%s`. \n"
-            "2. Please merge the PR only after the tests have passed. \n"
-            "3. Feel free to push to the bot's branch to update this PR if "
-            "needed. \n" % (self.old_pkg, self.new_pkg, self.rationale, self.new_pkg),
-        )
-        return body
-
-    def commit_message(self, feedstock_ctx: FeedstockContext) -> str:
-        return f"use {self.new_pkg} instead of {self.old_pkg}"
-
-    def pr_title(self, feedstock_ctx: FeedstockContext) -> str:
-        return f"Suggestion: depend on {self.new_pkg} instead of {self.old_pkg}"
-
-    def remote_branch(self, feedstock_ctx: FeedstockContext) -> str:
-        return f"{self.old_pkg}-to-{self.new_pkg}-migration-{self.migrator_version}"
 
     def migrator_uid(self, attrs: "AttrsTypedDict") -> "MigrationUidTypedDict":
         n = super().migrator_uid(attrs)

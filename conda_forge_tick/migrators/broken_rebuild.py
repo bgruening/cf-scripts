@@ -2,8 +2,8 @@ import os
 
 import networkx as nx
 
+from conda_forge_tick.contexts import ClonedFeedstockContext
 from conda_forge_tick.migrators.core import Migrator
-
 
 BROKEN_PACKAGES = """\
 linux-ppc64le/adios2-2.7.1-mpi_mpich_py36ha1d8cba_0.tar.bz2
@@ -325,8 +325,23 @@ class RebuildBroken(Migrator):
         *,
         outputs_lut,
         pr_limit: int = 0,
+        graph: nx.DiGraph = None,
+        effective_graph: nx.DiGraph = None,
     ):
-        super().__init__(1, check_solvable=False)
+        if not hasattr(self, "_init_args"):
+            self._init_args = []
+
+        if not hasattr(self, "_init_kwargs"):
+            self._init_kwargs = {
+                "outputs_lut": outputs_lut,
+                "pr_limit": pr_limit,
+                "graph": graph,
+                "effective_graph": effective_graph,
+            }
+
+        super().__init__(
+            1, check_solvable=False, graph=graph, effective_graph=effective_graph
+        )
         self.name = "rebuild-broken"
 
         outputs_to_migrate = {split_pkg(pkg)[1] for pkg in BROKEN_PACKAGES}
@@ -334,6 +349,8 @@ class RebuildBroken(Migrator):
         for output in outputs_to_migrate:
             for fs in outputs_lut.get(output, {output}):
                 self.feedstocks_to_migrate |= {fs}
+
+        self._reset_effective_graph()
 
     def order(
         self,
@@ -364,7 +381,7 @@ class RebuildBroken(Migrator):
         self.set_build_number(os.path.join(recipe_dir, "meta.yaml"))
         return super().migrate(recipe_dir, attrs)
 
-    def pr_body(self, feedstock_ctx) -> str:
+    def pr_body(self, feedstock_ctx: ClonedFeedstockContext) -> str:
         body = super().pr_body(feedstock_ctx)
         body = body.format(
             """\

@@ -1,20 +1,17 @@
+import logging
 import os
 import typing
 from typing import Any
-import logging
-from conda_forge_tick.utils import (
-    yaml_safe_load,
-    yaml_safe_dump,
-)
 
-from conda_forge_tick.os_utils import pushd
-from conda_forge_tick.utils import _get_source_code
 from conda_forge_tick.migrators.core import MiniMigrator
+from conda_forge_tick.os_utils import pushd
+from conda_forge_tick.provide_source_code import provide_source_code
+from conda_forge_tick.utils import yaml_safe_dump, yaml_safe_load
 
 if typing.TYPE_CHECKING:
     from ..migrators_types import AttrsTypedDict
 
-LOGGER = logging.getLogger("conda_forge_tick.migrators.cross_compile")
+logger = logging.getLogger(__name__)
 
 
 class CrossCompilationMigratorBase(MiniMigrator):
@@ -42,75 +39,75 @@ class UpdateConfigSubGuessMigrator(CrossCompilationMigratorBase):
         ):
             return
         try:
-            cb_work_dir = _get_source_code(recipe_dir)
-        except RuntimeError:
-            return
-        if cb_work_dir is None:
-            return
-        directories = set()
-        with pushd(cb_work_dir):
-            for dp, dn, fn in os.walk("."):
-                for f in fn:
-                    if f != "config.sub":
-                        continue
-                    if os.path.exists(os.path.join(dp, "config.guess")):
-                        directories.add(dp)
+            with provide_source_code(recipe_dir) as cb_work_dir:
+                if cb_work_dir is None:
+                    return
+                directories = set()
+                with pushd(cb_work_dir):
+                    for dp, dn, fn in os.walk("."):
+                        for f in fn:
+                            if f != "config.sub":
+                                continue
+                            if os.path.exists(os.path.join(dp, "config.guess")):
+                                directories.add(dp)
 
-        if not directories:
-            return
+                if not directories:
+                    return
 
-        with pushd(recipe_dir):
-            if not os.path.exists("build.sh"):
-                return
-            with open("build.sh") as f:
-                lines = list(f.readlines())
-                for line in lines:
-                    if line.strip().startswith(
-                        "cp $BUILD_PREFIX/share/gnuconfig",
-                    ):
+                with pushd(recipe_dir):
+                    if not os.path.exists("build.sh"):
                         return
-                    if line.strip().startswith(
-                        "cp $BUILD_PREFIX/share/libtool/build-aux/config",
-                    ):
-                        return
-                    if line.strip().startswith("autoreconf"):
-                        for word in line.split(" "):
-                            if word == "--force":
-                                return
-                            if (
-                                word.startswith("-")
-                                and not word.startswith("--")
-                                and "f" in word
+                    with open("build.sh") as f:
+                        lines = list(f.readlines())
+                        for line in lines:
+                            if line.strip().startswith(
+                                "cp $BUILD_PREFIX/share/gnuconfig",
                             ):
                                 return
-                    if line.strip().startswith("./autogen.sh"):
-                        return
-                insert_at = 0
-                if lines[0].startswith("#"):
-                    insert_at = 1
-                for d in directories:
-                    lines.insert(
-                        insert_at,
-                        f"cp $BUILD_PREFIX/share/gnuconfig/config.* {d}\n",
-                    )
-                lines.insert(
-                    insert_at,
-                    "# Get an updated config.sub and config.guess\n",
-                )
-            with open("build.sh", "w") as f:
-                f.write("".join(lines))
+                            if line.strip().startswith(
+                                "cp $BUILD_PREFIX/share/libtool/build-aux/config",
+                            ):
+                                return
+                            if line.strip().startswith("autoreconf"):
+                                for word in line.split(" "):
+                                    if word == "--force":
+                                        return
+                                    if (
+                                        word.startswith("-")
+                                        and not word.startswith("--")
+                                        and "f" in word
+                                    ):
+                                        return
+                            if line.strip().startswith("./autogen.sh"):
+                                return
+                        insert_at = 0
+                        if lines[0].startswith("#"):
+                            insert_at = 1
+                        for d in directories:
+                            lines.insert(
+                                insert_at,
+                                f"cp $BUILD_PREFIX/share/gnuconfig/config.* {d}\n",
+                            )
+                        lines.insert(
+                            insert_at,
+                            "# Get an updated config.sub and config.guess\n",
+                        )
+                    with open("build.sh", "w") as f:
+                        f.write("".join(lines))
 
-            with open("meta.yaml") as f:
-                lines = f.readlines()
-            for i, line in enumerate(lines):
-                if line.strip().startswith("- {{ compiler"):
-                    new_line = " " * (len(line) - len(line.lstrip()))
-                    new_line += "- gnuconfig  # [unix]\n"
-                    lines.insert(i, new_line)
-                    break
+                    with open("meta.yaml") as f:
+                        lines = f.readlines()
+                    for i, line in enumerate(lines):
+                        if line.strip().startswith("- {{ compiler"):
+                            new_line = " " * (len(line) - len(line.lstrip()))
+                            new_line += "- gnuconfig  # [unix]\n"
+                            lines.insert(i, new_line)
+                            break
 
-            with open("meta.yaml", "w") as f:
-                f.write("".join(lines))
+                    with open("meta.yaml", "w") as f:
+                        f.write("".join(lines))
+        except RuntimeError:
+            return
 
 
 class GuardTestingMigrator(CrossCompilationMigratorBase):
@@ -131,7 +128,8 @@ class GuardTestingMigrator(CrossCompilationMigratorBase):
                 ):
                     lines.insert(
                         i,
-                        'if [[ "${CONDA_BUILD_CROSS_COMPILATION:-}" != "1" || "${CROSSCOMPILING_EMULATOR}" != "" ]]; then\n',
+                        'if [[ "${CONDA_BUILD_CROSS_COMPILATION:-}" != "1" '
+                        '|| "${CROSSCOMPILING_EMULATOR}" != "" ]]; then\n',
                     )
                     insert_after = i + 1
                     while len(lines) > insert_after and lines[insert_after].endswith(
@@ -379,7 +377,7 @@ class CrossCompilationForARMAndPower(MiniMigrator):
         with pushd(recipe_dir):
             if not os.path.exists("../conda-forge.yml"):
                 name = attrs.get("feedstock_name")
-                LOGGER.info(f"no conda-forge.yml for {name}")
+                logger.info(f"no conda-forge.yml for {name}")
                 return
 
             with open("../conda-forge.yml") as f:
@@ -394,7 +392,7 @@ class CrossCompilationForARMAndPower(MiniMigrator):
                         config["build_platform"][arch] = "linux_64"
                 with open("../conda-forge.yml", "w") as f:
                     name = attrs.get("feedstock_name")
-                    LOGGER.info(f"new conda-forge.yml for {name}:={config}")
+                    logger.info(f"new conda-forge.yml for {name}:={config}")
                     yaml_safe_dump(config, f)
 
             if not os.path.exists("build.sh"):
@@ -409,7 +407,10 @@ class CrossCompilationForARMAndPower(MiniMigrator):
                 'if [[ "$CONDA_BUILD_CROSS_COMPILATION" == "0" ]]; then\n',
                 'if [[ "${CONDA_BUILD_CROSS_COMPILATION}" == "0" ]]; then\n',
             ]
-            new_guard_line = 'if [[ "${CONDA_BUILD_CROSS_COMPILATION:-}" != "1" || "${CROSSCOMPILING_EMULATOR}" != "" ]]; then\n'
+            new_guard_line = (
+                'if [[ "${CONDA_BUILD_CROSS_COMPILATION:-}" != "1" '
+                '|| "${CROSSCOMPILING_EMULATOR}" != "" ]]; then\n'
+            )
             for i, line in enumerate(lines):
                 if (
                     (

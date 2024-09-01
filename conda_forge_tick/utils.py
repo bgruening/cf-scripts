@@ -1,66 +1,80 @@
+import contextlib
+import copy
 import datetime
+import io
+import itertools
+import json
+import logging
+import os
+import pprint
+import subprocess
+import sys
+import tempfile
 import traceback
 import typing
-import pprint
 import warnings
 from collections import defaultdict
-import contextlib
-import itertools
-import logging
-import tempfile
-import io
-import os
-import sys
-import copy
-from typing import Any, Tuple, Iterable, Optional, Set
+from typing import Any, Callable, Dict, Iterable, Optional, Set, Tuple, cast
 
-import github3
 import jinja2
+import jinja2.sandbox
+import networkx as nx
 import ruamel.yaml
 
-import networkx as nx
-
 from . import sensitive_env
+from ._version import __version__
 from .lazy_json_backends import LazyJson
 
 if typing.TYPE_CHECKING:
     from mypy_extensions import TypedDict
-    from conda_forge_tick.migrators_types import MetaYamlTypedDict
 
-logger = logging.getLogger("conda_forge_tick.utils")
+    from conda_forge_tick.migrators_types import RecipeTypedDict
+
+logger = logging.getLogger(__name__)
 
 T = typing.TypeVar("T")
 TD = typing.TypeVar("TD", bound=dict, covariant=True)
 
 PACKAGE_STUBS = [
     "_compiler_stub",
+    "_stdlib_stub",
     "subpackage_stub",
     "compatible_pin_stub",
     "cdt_stub",
 ]
 
+
+class MockOS:
+    def __init__(self):
+        self.environ = defaultdict(str)
+        self.sep = "/"
+
+
 CB_CONFIG = dict(
-    os=os,
+    os=MockOS(),
     environ=defaultdict(str),
     compiler=lambda x: x + "_compiler_stub",
+    stdlib=lambda x: x + "_stdlib_stub",
     pin_subpackage=lambda *args, **kwargs: args[0],
     pin_compatible=lambda *args, **kwargs: args[0],
     cdt=lambda *args, **kwargs: "cdt_stub",
     cran_mirror="https://cran.r-project.org",
     datetime=datetime,
+    load_file_regex=lambda *args, **kwargs: None,
 )
 
 
-def _munge_dict_repr(d):
-    d = repr(d)
-    d = "__dict__" + d[1:-1].replace(":", "@").replace(" ", "$$") + "__dict__"
-    return d
+def _munge_dict_repr(dct: Dict[Any, Any]) -> str:
+    from urllib.parse import quote_plus
+
+    return "__quote_plus__" + quote_plus(repr(dct)) + "__quote_plus__"
 
 
 CB_CONFIG_PINNING = dict(
-    os=os,
+    os=MockOS(),
     environ=defaultdict(str),
     compiler=lambda x: x + "_compiler_stub",
+    stdlib=lambda x: x + "_stdlib_stub",
     # The `max_pin, ` stub is so we know when people used the functions
     # to create the pins
     pin_subpackage=lambda *args, **kwargs: _munge_dict_repr(
@@ -72,42 +86,265 @@ CB_CONFIG_PINNING = dict(
     cdt=lambda *args, **kwargs: "cdt_stub",
     cran_mirror="https://cran.r-project.org",
     datetime=datetime,
+    load_file_regex=lambda *args, **kwargs: None,
 )
+
+DEFAULT_GRAPH_FILENAME = "graph.json"
+
+DEFAULT_CONTAINER_TMPFS_SIZE_MB = 6000
+
+
+def parse_munged_run_export(p: str) -> Dict:
+    from urllib.parse import unquote_plus
+
+    # get rid of comments
+    p = p.split("#")[0].strip()
+
+    # remove build string
+    p = p.rsplit("__quote_plus__", maxsplit=1)[0].strip()
+
+    # unquote
+    if p.startswith("__quote_plus__") or p.endswith("__quote_plus__"):
+        if p.startswith("__quote_plus__"):
+            p = p[len("__quote_plus__") :]
+        if p.endswith("__quote_plus__"):
+            p = p[: -len("__quote_plus__")]
+        p = unquote_plus(p)
+
+    return cast(Dict, yaml_safe_load(p))
+
+
+def get_default_container_name():
+    """Get the default container name for the bot.
+
+    The image is stored at `ghcr.io/regro/conda-forge-tick`.
+
+    If the environment variable `CF_TICK_CONTAINER_TAG` is set, then that tag is pulled.
+    Otherwise, we pull the tag `__version__`.
+    """
+    cname = (
+        f"{os.environ.get('CF_TICK_CONTAINER_NAME', 'ghcr.io/regro/conda-forge-tick')}"
+        + f":{os.environ.get('CF_TICK_CONTAINER_TAG', __version__)}"
+    )
+
+    return cname
+
+
+class ContainerRuntimeError(RuntimeError):
+    """An error raised when running a container fails."""
+
+    def __init__(self, *, error, name, cmd, returncode, traceback=None):
+        self.name = name
+        self.cmd = cmd
+        self.returncode = returncode
+        self.traceback = traceback
+        super().__init__(error)
+
+
+def get_default_container_run_args(
+    tmpfs_size_mb: int = DEFAULT_CONTAINER_TMPFS_SIZE_MB,
+):
+    """Get the default arguments for running a container.
+
+    Parameters
+    ----------
+    tmpfs_size_mb : int, optional
+        The size of the tmpfs in MB, by default 10.
+
+    Returns
+    -------
+    list
+        The command to run a container.
+    """
+    extra_env_vars = []
+    if os.environ.get("RUN_URL", None) is not None:
+        extra_env_vars.append("-e")
+        extra_env_vars.append("RUN_URL")
+
+    tmpfs_size_bytes = tmpfs_size_mb * 1000 * 1000
+    return (
+        [
+            "docker",
+            "run",
+            "-e",
+            "CF_TICK_IN_CONTAINER=true",
+        ]
+        + extra_env_vars
+        + [
+            "--security-opt=no-new-privileges",
+            "--read-only",
+            "--cap-drop=all",
+            "--mount",
+            f"type=tmpfs,destination=/tmp,tmpfs-mode=1777,tmpfs-size={tmpfs_size_bytes}",
+            "-m",
+            "6000m",
+            "--cpus",
+            "1",
+            "--ulimit",
+            "nofile=1024:1024",
+            "--ulimit",
+            "nproc=2048:2048",
+            "--rm",
+            "-i",
+        ]
+    )
+
+
+def run_container_task(
+    name: str,
+    args: Iterable[str],
+    json_loads: Callable = json.loads,
+    tmpfs_size_mb: int = DEFAULT_CONTAINER_TMPFS_SIZE_MB,
+    input: Optional[str] = None,
+    mount_dir: Optional[str] = None,
+    mount_readonly: bool = True,
+):
+    """Run a bot task in a container.
+
+    Parameters
+    ----------
+    name
+        The name of the task.
+    args
+        The arguments to pass to the container.
+    json_loads
+        The function to use to load JSON to a string, by default `json.loads`.
+    tmpfs_size_mb
+        The size of the tmpfs in MB, by default 10.
+    input
+        The input to pass to the container, by default None.
+    mount_dir
+        The directory to mount to the container at `/cf_tick_dir`, by default None.
+    mount_readonly
+        Whether to mount the directory as read-only, by default True.
+
+    Returns
+    -------
+    data : dict-like
+        The result of the task.
+    """
+    if mount_dir is not None:
+        mount_dir = os.path.abspath(mount_dir)
+        mnt_args = ["--mount", f"type=bind,source={mount_dir},destination=/cf_tick_dir"]
+        if mount_readonly:
+            mnt_args[-1] += ",readonly"
+    else:
+        mnt_args = []
+
+    log_level_str = str(logging.getLevelName(logger.getEffectiveLevel())).lower()
+    logger.debug("computed effective logging level: %s", log_level_str)
+
+    cmd = [
+        *get_default_container_run_args(tmpfs_size_mb=tmpfs_size_mb),
+        *mnt_args,
+        get_default_container_name(),
+        "/opt/conda/envs/cf-scripts/bin/python",
+        "-u",
+        "/opt/autotick-bot/docker/run_bot_task.py",
+        name,
+        *args,
+        "--log-level",
+        log_level_str,
+    ]
+    res = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        text=True,
+        input=input,
+    )
+    # we handle this ourselves to customize the error message
+    if res.returncode != 0:
+        raise ContainerRuntimeError(
+            error=f"Error running {name} in container - return code {res.returncode}:"
+            f"\ncmd: {pprint.pformat(cmd)}"
+            f"\noutput: {pprint.pformat(res.stdout)}",
+            name=name,
+            cmd=pprint.pformat(cmd),
+            returncode=res.returncode,
+        )
+
+    try:
+        ret = json_loads(res.stdout)
+    except json.JSONDecodeError:
+        raise ContainerRuntimeError(
+            error=f"Error running {name} in container - JSON could not parse stdout:"
+            f"\ncmd: {pprint.pformat(cmd)}"
+            f"\noutput: {pprint.pformat(res.stdout)}",
+            name=name,
+            cmd=pprint.pformat(cmd),
+            returncode=res.returncode,
+        )
+
+    if "error" in ret:
+        ret_str = (
+            ret["error"]
+            .split("(", maxsplit=1)[1]
+            .rsplit(")", maxsplit=1)[0]
+            .encode("raw_unicode_escape")
+            .decode("unicode_escape")
+        )
+        raise ContainerRuntimeError(
+            error=f"Error running {name} in container - error {ret['error'].split('(')[0]} raised:\n{ret_str}",
+            name=name,
+            cmd=pprint.pformat(cmd),
+            returncode=res.returncode,
+            traceback=ret["traceback"]
+            .encode("raw_unicode_escape")
+            .decode("unicode_escape"),
+        )
+
+    return ret["data"]
+
+
+REPRINTED_LINES = {}
+
+
+@contextlib.contextmanager
+def filter_reprinted_lines(key):
+    global REPRINTED_LINES
+    if key not in REPRINTED_LINES:
+        REPRINTED_LINES[key] = set()
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            yield
+    finally:
+        for line in stdout.getvalue().split("\n"):
+            if line not in REPRINTED_LINES[key]:
+                print(line, file=sys.stdout)
+                REPRINTED_LINES[key].add(line)
+        for line in stderr.getvalue().split("\n"):
+            if line not in REPRINTED_LINES[key]:
+                print(line, file=sys.stderr)
+                REPRINTED_LINES[key].add(line)
+
+
+LOG_LINES_FOLDED = False
 
 
 @contextlib.contextmanager
 def fold_log_lines(title):
+    global LOG_LINES_FOLDED
     try:
         sys.stdout.flush()
         sys.stderr.flush()
-        if os.environ.get("GITHUB_ACTIONS", "false") == "true":
+        if os.environ.get("GITHUB_ACTIONS", "false") == "true" and not LOG_LINES_FOLDED:
+            LOG_LINES_FOLDED = True
             print(f"::group::{title}", flush=True)
+        else:
+            print(">" * 80, flush=True)
+            print(">" * 80, flush=True)
+            print("> " + title, flush=True)
         yield
     finally:
         sys.stdout.flush()
         sys.stderr.flush()
         if os.environ.get("GITHUB_ACTIONS", "false") == "true":
+            LOG_LINES_FOLDED = False
             print("::endgroup::", flush=True)
-
-
-def parse_munged_run_export(p):
-    if len(p) <= len("__dict__"):
-        logger.info("could not parse run export for pinning: %r", p)
-        return {}
-
-    p_orig = p
-
-    # remove build string if it is there
-    p = p.rsplit("__dict__", maxsplit=1)[0].strip()
-
-    if p.startswith("__dict__"):
-        p = "{" + p[len("__dict__") :].replace("$$", " ").replace("@", ":") + "}"
-        p = yaml_safe_load(p)
-        logger.debug("parsed run export for pinning: %r", p)
-        return p
-    else:
-        logger.info("could not parse run export for pinning: %r", p_orig)
-        return {}
 
 
 def yaml_safe_load(stream):
@@ -122,7 +359,7 @@ def yaml_safe_dump(data, stream=None):
     return yaml.dump(data, stream=stream)
 
 
-def render_meta_yaml(text: str, for_pinning=False, **kwargs) -> str:
+def _render_meta_yaml(text: str, for_pinning: bool = False, **kwargs) -> str:
     """Render the meta.yaml with Jinja2 variables.
 
     Parameters
@@ -139,7 +376,7 @@ def render_meta_yaml(text: str, for_pinning=False, **kwargs) -> str:
 
     cfg = dict(**kwargs)
 
-    env = jinja2.Environment(undefined=NullUndefined)
+    env = jinja2.sandbox.SandboxedEnvironment(undefined=NullUndefined)
     if for_pinning:
         cfg.update(**CB_CONFIG_PINNING)
     else:
@@ -156,29 +393,396 @@ def render_meta_yaml(text: str, for_pinning=False, **kwargs) -> str:
         raise
 
 
+def parse_recipe_yaml(
+    text: str,
+    for_pinning: bool = False,
+    platform_arch: str | None = None,
+    cbc_path: str | None = None,
+    use_container: bool | None = None,
+) -> "RecipeTypedDict":
+    """Parse the recipe.yaml.
+
+    Parameters
+    ----------
+    text : str
+        The raw text in conda-forge feedstock recipe.yaml file
+    for_pinning : bool, optional
+        If True, render the recipe.yaml for pinning migrators, by default False.
+    platform_arch : str, optional
+        The platform and arch (e.g., 'linux-64', 'osx-arm64', 'win-64').
+    cbc_path : str, optional
+        The path to global pinning file.
+    log_debug : bool, optional
+        If True, print extra debugging info. Default is False.
+    use_container
+        Whether to use a container to run the parsing.
+        If None, the function will use a container if the environment
+        variable `CF_TICK_IN_CONTAINER` is 'false'. This feature can be
+        used to avoid container in container calls.
+
+    Returns
+    -------
+    dict :
+        The parsed YAML dict. If parsing fails, returns an empty dict. May raise
+        for some errors. Have fun.
+    """
+    in_container = os.environ.get("CF_TICK_IN_CONTAINER", "false") == "true"
+    if use_container is None:
+        use_container = not in_container
+
+    if use_container and not in_container:
+        return parse_recipe_yaml_containerized(
+            text,
+            for_pinning=for_pinning,
+            platform_arch=platform_arch,
+            cbc_path=cbc_path,
+        )
+    else:
+        return parse_recipe_yaml_local(
+            text,
+            for_pinning=for_pinning,
+            platform_arch=platform_arch,
+            cbc_path=cbc_path,
+        )
+
+
+def parse_recipe_yaml_containerized(
+    text: str,
+    for_pinning: bool = False,
+    platform_arch: str | None = None,
+    cbc_path: str | None = None,
+) -> "RecipeTypedDict":
+    """Parse the recipe.yaml.
+
+    **This function runs the parsing in a container.**
+
+    Parameters
+    ----------
+    text : str
+        The raw text in conda-forge feedstock recipe.yaml file
+    for_pinning : bool, optional
+        If True, render the recipe.yaml for pinning migrators, by default False.
+    platform_arch : str, optional
+        The platform and arch (e.g., 'linux-64', 'osx-arm64', 'win-64').
+    cbc_path : str, optional
+        The path to global pinning file.
+
+    Returns
+    -------
+    dict :
+        The parsed YAML dict. If parsing fails, returns an empty dict. May raise
+        for some errors. Have fun.
+    """
+    args = []
+
+    if platform_arch is not None:
+        args += ["--platform-arch", platform_arch]
+
+    if cbc_path is not None:
+        args += ["--cbc-path", cbc_path]
+
+    if for_pinning:
+        args += ["--for-pinning"]
+
+    return run_container_task(
+        "parse-recipe-yaml",
+        args,
+        input=text,
+        mount_readonly=True,
+    )
+
+
+def parse_recipe_yaml_local(
+    text: str,
+    for_pinning: bool = False,
+    platform_arch: str | None = None,
+    cbc_path: str | None = None,
+) -> "RecipeTypedDict":
+    """Parse the recipe.yaml.
+
+    Parameters
+    ----------
+    text : str
+        The raw text in conda-forge feedstock recipe.yaml file
+    for_pinning : bool, optional
+        If True, render the recipe.yaml for pinning migrators, by default False.
+    platform_arch : str, optional
+        The platform and arch (e.g., 'linux-64', 'osx-arm64', 'win-64').
+    cbc_path : str, optional
+        The path to global pinning file.
+
+    Returns
+    -------
+    dict :
+        The parsed YAML dict. If parsing fails, returns an empty dict. May raise
+        for some errors. Have fun.
+    """
+
+    rendered_recipes = _render_recipe_yaml(
+        text, cbc_path=cbc_path, platform_arch=platform_arch
+    )
+    if for_pinning:
+        rendered_recipes = _process_recipe_for_pinning(rendered_recipes)
+    parsed_recipes = _parse_recipes(rendered_recipes)
+    return parsed_recipes
+
+
+def _render_recipe_yaml(
+    text: str,
+    platform_arch: str | None = None,
+    cbc_path: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Renders the given recipe YAML text using the `rattler-build` command-line tool.
+
+    Parameters
+    ----------
+    text : str
+        The recipe YAML text to render.
+    platform : str, optional
+        The platform (e.g., 'linux', 'osx', 'win').
+    cbc_path : str, optional
+        The path to global pinning file.
+
+    Returns
+    -------
+    dict[str, Any]
+        The rendered recipe as a dictionary.
+    """
+    variant_config_flags = [] if cbc_path is None else ["--variant-config", cbc_path]
+    build_platform_flags = (
+        [] if platform_arch is None else ["--build-platform", platform_arch]
+    )
+    res = subprocess.run(
+        ["rattler-build", "build", "--render-only"]
+        + variant_config_flags
+        + build_platform_flags,
+        stdout=subprocess.PIPE,
+        text=True,
+        input=text,
+        check=True,
+    )
+    return [output["recipe"] for output in json.loads(res.stdout)]
+
+
+def _process_recipe_for_pinning(recipes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def replace_name_key(d: dict[str, Any]) -> Any:
+        for key, value in d.items():
+            if isinstance(value, dict):
+                if key in ["pin_subpackage", "pin_compatible"] and "name" in value:
+                    # Create a new dictionary with 'package_name' first
+                    new_value = {"package_name": value.pop("name")}
+                    new_value.update(value)
+                    d[key] = {"name": _munge_dict_repr(new_value)}
+                else:
+                    replace_name_key(value)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        replace_name_key(item)
+        return d
+
+    return [replace_name_key(recipe) for recipe in recipes]
+
+
+def _parse_recipes(
+    validated_recipes: list[dict[str, Any]],
+) -> "RecipeTypedDict":
+    """Parses validated recipes and transform them to fit `RecipeTypedDict`
+
+    Parameters
+    ----------
+    validated_recipes : list[dict[str, Any]]
+        The recipes validated and rendered by `rattler-build`
+
+    Returns
+    -------
+    RecipeTypedDict
+        A dict conforming to conda-build's rendered output
+    """
+    first = validated_recipes[0]
+    about = first["about"]
+    build = first["build"]
+    requirements = first["requirements"]
+    package = first["package"]
+    source = first.get("source")
+
+    about_data = (
+        None
+        if about is None
+        else {
+            "description": about.get("description"),
+            "dev_url": about.get("repository"),
+            "doc_url": about.get("documentation"),
+            "home": about.get("homepage"),
+            "license": about.get("license"),
+            "license_family": about.get("license"),
+            "license_file": about.get("license_file")[0],
+            "summary": about.get("summary"),
+        }
+    )
+
+    _parse_recipe_yaml_requirements(requirements)
+
+    build_data = (
+        None
+        if build is None or requirements is None
+        else {
+            "noarch": build.get("noarch"),
+            "number": str(build.get("number")),
+            "script": build.get("script"),
+            "run_exports": requirements.get("run_exports"),
+        }
+    )
+    package_data = (
+        None
+        if package is None
+        else {"name": package.get("name"), "version": package.get("version")}
+    )
+    if isinstance(source, list) and len(source) > 0:
+        source_data = {
+            "fn": source[0].get("file_name"),
+            "patches": source[0].get("patches"),
+            "sha256": source[0].get("sha256"),
+            "url": source[0].get("url"),
+        }
+
+    requirements_data = (
+        None
+        if requirements is None
+        else {
+            "build": requirements.get("build"),
+            "host": requirements.get("host"),
+            "run": requirements.get("run"),
+        }
+    )
+    output_data = []
+    for recipe in validated_recipes:
+        package_output = recipe.get("package")
+        requirements_output = recipe.get("requirements")
+
+        run_exports_output = (
+            None
+            if requirements_output is None
+            else requirements_output.get("run_exports")
+        )
+        requirements_output_data = (
+            None
+            if requirements_output is None
+            else {
+                "build": requirements_output.get("build", []),
+                "host": requirements_output.get("host", []),
+                "run": requirements_output.get("run", []),
+            }
+        )
+        build_output_data = (
+            None
+            if run_exports_output is None
+            else {
+                "strong": run_exports_output.get("strong", []),
+                "weak": run_exports_output.get("weak", []),
+            }
+        )
+        output_data.append(
+            {
+                "name": None if package_output is None else package_output.get("name"),
+                "requirements": requirements_output_data,
+                "test": None,
+                "build": build_output_data,
+            }
+        )
+
+    parsed_recipes = {
+        "about": about_data,
+        "build": build_data,
+        "package": package_data,
+        "requirements": requirements_data,
+        "source": source_data,
+        "test": None,
+        "outputs": output_data,
+        "extra": first.get("extra"),
+    }
+
+    return _remove_none_values(parsed_recipes)
+
+
+def _parse_recipe_yaml_requirements(requirements) -> None:
+    """Parse requirement section of render by rattler-build to fit `RecipeTypedDict`
+
+
+    When rendering the recipe by rattler build,
+    `requirements["run_exports"]["weak"]` gives a list looking like:
+    [
+        {
+          "pin_subpackage": {
+            "name": "slepc",
+            "lower_bound": "x.x.x.x.x.x",
+            "upper_bound": "x.x"
+          }
+        },
+        "numpy"
+    ]
+    `run_exports["weak"]` of RecipeTypedDict looks like:
+    [
+        "slepc",
+        "numpy"
+    ]
+
+    The same applies to "strong".
+
+    This function takes care of this transformation
+
+        requirements : dict
+        The requirements section of the recipe rendered by rattler-build.
+        This parameter will be modified by this function.
+    """
+    if "run_exports" not in requirements:
+        return
+
+    run_exports = requirements["run_exports"]
+    for strength in ["strong", "weak"]:
+        original = run_exports.get(strength)
+        if isinstance(original, list):
+            result = []
+            for entry in original:
+                if isinstance(entry, str):
+                    result.append(entry)
+                elif isinstance(entry, dict):
+                    for key in ["pin_subpackage", "pin_compatible"]:
+                        if key in entry and "name" in entry[key]:
+                            result.append(entry[key]["name"])
+            run_exports[strength] = result
+
+
+def _remove_none_values(d):
+    """Recursively remove dictionary entries with None values."""
+    if not isinstance(d, dict):
+        return d
+    return {k: _remove_none_values(v) for k, v in d.items() if v is not None}
+
+
 def parse_meta_yaml(
     text: str,
     for_pinning=False,
     platform=None,
     arch=None,
-    recipe_dir=None,
     cbc_path=None,
-    log_debug=False,
     orig_cbc_path=None,
-    **kwargs: Any,
-) -> "MetaYamlTypedDict":
+    log_debug=False,
+    use_container: bool | None = None,
+) -> "RecipeTypedDict":
     """Parse the meta.yaml.
 
     Parameters
     ----------
     text : str
         The raw text in conda-forge feedstock meta.yaml file
+    for_pinning : bool, optional
+        If True, render the meta.yaml for pinning migrators, by default False.
     platform : str, optional
         The platform (e.g., 'linux', 'osx', 'win').
     arch : str, optional
         The CPU architecture (e.g., '64', 'aarch64').
-    recipe_dir : str, optional
-        The path to the recipe being parsed.
     cbc_path : str, optional
         The path to global pinning file.
     orig_cbc_path : str, optional
@@ -186,8 +790,157 @@ def parse_meta_yaml(
         the recipe while parsing.
     log_debug : bool, optional
         If True, print extra debugging info. Default is False.
-    **kwargs : glob for extra keyword arguments
-        These are passed to the conda_build.config.Config constructor.
+    use_container
+        Whether to use a container to run the parsing.
+        If None, the function will use a container if the environment
+        variable `CF_TICK_IN_CONTAINER` is 'false'. This feature can be
+        used to avoid container in container calls.
+
+    Returns
+    -------
+    dict :
+        The parsed YAML dict. If parsing fails, returns an empty dict. May raise
+        for some errors. Have fun.
+    """
+    in_container = os.environ.get("CF_TICK_IN_CONTAINER", "false") == "true"
+    if use_container is None:
+        use_container = not in_container
+
+    if use_container and not in_container:
+        return parse_meta_yaml_containerized(
+            text,
+            for_pinning=for_pinning,
+            platform=platform,
+            arch=arch,
+            cbc_path=cbc_path,
+            orig_cbc_path=orig_cbc_path,
+            log_debug=log_debug,
+        )
+    else:
+        return parse_meta_yaml_local(
+            text,
+            for_pinning=for_pinning,
+            platform=platform,
+            arch=arch,
+            cbc_path=cbc_path,
+            orig_cbc_path=orig_cbc_path,
+            log_debug=log_debug,
+        )
+
+
+def parse_meta_yaml_containerized(
+    text: str,
+    for_pinning=False,
+    platform=None,
+    arch=None,
+    cbc_path=None,
+    orig_cbc_path=None,
+    log_debug=False,
+) -> "RecipeTypedDict":
+    """Parse the meta.yaml.
+
+    **This function runs the parsing in a container.**
+
+    Parameters
+    ----------
+    text : str
+        The raw text in conda-forge feedstock meta.yaml file
+    for_pinning : bool, optional
+        If True, render the meta.yaml for pinning migrators, by default False.
+    platform : str, optional
+        The platform (e.g., 'linux', 'osx', 'win').
+    arch : str, optional
+        The CPU architecture (e.g., '64', 'aarch64').
+    cbc_path : str, optional
+        The path to global pinning file.
+    orig_cbc_path : str, optional
+        If not None, the original conda build config file to put next to
+        the recipe while parsing.
+    log_debug : bool, optional
+        If True, print extra debugging info. Default is False.
+
+    Returns
+    -------
+    dict :
+        The parsed YAML dict. If parsing fails, returns an empty dict. May raise
+        for some errors. Have fun.
+    """
+    args = []
+
+    if platform is not None:
+        args += ["--platform", platform]
+
+    if arch is not None:
+        args += ["--arch", arch]
+
+    if log_debug:
+        args += ["--log-debug"]
+
+    if for_pinning:
+        args += ["--for-pinning"]
+
+    def _run(_args, _mount_dir):
+        return run_container_task(
+            "parse-meta-yaml",
+            _args,
+            input=text,
+            mount_readonly=True,
+            mount_dir=_mount_dir,
+        )
+
+    if (cbc_path is not None and os.path.exists(cbc_path)) or (
+        orig_cbc_path is not None and os.path.exists(orig_cbc_path)
+    ):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.chmod(tmpdir, 0o755)
+
+            if cbc_path is not None and os.path.exists(cbc_path):
+                with open(os.path.join(tmpdir, "cbc_path.yaml"), "w") as fp:
+                    with open(cbc_path) as fp_r:
+                        fp.write(fp_r.read())
+                args += ["--cbc-path", "/cf_tick_dir/cbc_path.yaml"]
+
+            if orig_cbc_path is not None and os.path.exists(orig_cbc_path):
+                with open(os.path.join(tmpdir, "orig_cbc_path.yaml"), "w") as fp:
+                    with open(orig_cbc_path) as fp_r:
+                        fp.write(fp_r.read())
+                args += ["--orig-cbc-path", "/cf_tick_dir/orig_cbc_path.yaml"]
+
+            data = _run(args, tmpdir)
+    else:
+        data = _run(args, None)
+
+    return data
+
+
+def parse_meta_yaml_local(
+    text: str,
+    for_pinning=False,
+    platform=None,
+    arch=None,
+    cbc_path=None,
+    orig_cbc_path=None,
+    log_debug=False,
+) -> "RecipeTypedDict":
+    """Parse the meta.yaml.
+
+    Parameters
+    ----------
+    text : str
+        The raw text in conda-forge feedstock meta.yaml file
+    for_pinning : bool, optional
+        If True, render the meta.yaml for pinning migrators, by default False.
+    platform : str, optional
+        The platform (e.g., 'linux', 'osx', 'win').
+    arch : str, optional
+        The CPU architecture (e.g., '64', 'aarch64').
+    cbc_path : str, optional
+        The path to global pinning file.
+    orig_cbc_path : str, optional
+        If not None, the original conda build config file to put next to
+        the recipe while parsing.
+    log_debug : bool, optional
+        If True, print extra debugging info. Default is False.
 
     Returns
     -------
@@ -204,17 +957,28 @@ def parse_meta_yaml(
                 category=UserWarning,
                 module=r"conda_build\.environ",
             )
-            return _parse_meta_yaml_impl(
-                text,
-                for_pinning=for_pinning,
-                platform=platform,
-                arch=arch,
-                recipe_dir=recipe_dir,
-                cbc_path=cbc_path,
-                log_debug=log_debug,
-                orig_cbc_path=(orig_cbc_path if use_orig_cbc_path else None),
-                **kwargs,
-            )
+
+            class NumpyFilter(logging.Filter):
+                def filter(self, record):
+                    if record.msg.startswith("No numpy version specified"):
+                        return False
+                    return True
+
+            np_filter = NumpyFilter()
+            try:
+                logging.getLogger("conda_build.metadata").addFilter(np_filter)
+
+                return _parse_meta_yaml_impl(
+                    text,
+                    for_pinning=for_pinning,
+                    platform=platform,
+                    arch=arch,
+                    cbc_path=cbc_path,
+                    log_debug=log_debug,
+                    orig_cbc_path=(orig_cbc_path if use_orig_cbc_path else None),
+                )
+            finally:
+                logging.getLogger("conda_build.metadata").removeFilter(np_filter)
 
     try:
         return _run(use_orig_cbc_path=True)
@@ -224,7 +988,7 @@ def parse_meta_yaml(
             return _run(use_orig_cbc_path=False)
         except (SystemExit, Exception) as e:
             raise RuntimeError(
-                "cond build error: %s\n%s"
+                "conda build error: %s\n%s"
                 % (
                     repr(e),
                     traceback.format_exc(),
@@ -237,24 +1001,20 @@ def _parse_meta_yaml_impl(
     for_pinning=False,
     platform=None,
     arch=None,
-    recipe_dir=None,
     cbc_path=None,
     log_debug=False,
     orig_cbc_path=None,
-    **kwargs: Any,
-) -> "MetaYamlTypedDict":
-    from conda_build.config import Config
-    from conda_build.metadata import parse, MetaData
+) -> "RecipeTypedDict":
     import conda_build.api
     import conda_build.environ
+    from conda_build.config import Config
+    from conda_build.metadata import MetaData, parse
     from conda_build.variants import explode_variants
 
-    if (
-        recipe_dir is not None
-        and cbc_path is not None
-        and arch is not None
-        and platform is not None
-    ):
+    if logger.getEffectiveLevel() <= logging.DEBUG:
+        log_debug = True
+
+    if cbc_path is not None and arch is not None and platform is not None:
         with tempfile.TemporaryDirectory() as tmpdir:
             with open(os.path.join(tmpdir, "meta.yaml"), "w") as fp:
                 fp.write(text)
@@ -279,7 +1039,9 @@ def _parse_meta_yaml_impl(
                     None,
                     platform=platform,
                     arch=arch,
-                    exclusive_config_file=cbc_path,
+                    variant_config_files=[
+                        cbc_path,
+                    ],
                 )
                 _cbc, _ = conda_build.variants.get_package_combined_spec(
                     tmpdir,
@@ -296,9 +1058,12 @@ def _parse_meta_yaml_impl(
                 #   wurlitzer 3.0.2 py38h50d1736_1    conda-forge
                 #   conda     4.11.0           py38h50d1736_0    conda-forge
                 #   conda-build   3.21.7           py38h50d1736_0    conda-forge
-                with contextlib.redirect_stdout(
-                    fout,
-                ), contextlib.redirect_stderr(ferr):
+                with (
+                    contextlib.redirect_stdout(
+                        fout,
+                    ),
+                    contextlib.redirect_stderr(ferr),
+                ):
                     config, _cbc = _run_parsing()
             else:
                 config, _cbc = _run_parsing()
@@ -315,14 +1080,16 @@ def _parse_meta_yaml_impl(
                 try:
                     if cfg_as_dict[key].startswith("/"):
                         cfg_as_dict[key] = key
-                except Exception:
+                except Exception as e:
+                    logger.debug(
+                        "key-val not string: %s: %s", key, cfg_as_dict[key], exc_info=e
+                    )
                     pass
 
         cbc = Config(
             platform=platform,
             arch=arch,
             variant=cfg_as_dict,
-            **kwargs,
         )
     else:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -330,7 +1097,6 @@ def _parse_meta_yaml_impl(
                 fp.write(text)
 
             _cfg = {}
-            _cfg.update(kwargs)
             if platform is not None:
                 _cfg["platform"] = platform
             if arch is not None:
@@ -340,15 +1106,15 @@ def _parse_meta_yaml_impl(
             try:
                 m = MetaData(tmpdir)
                 cfg_as_dict = conda_build.environ.get_dict(m=m)
-            except (SystemExit, Exception):
-                cfg_as_dict = {}
+            except SystemExit as e:
+                raise RuntimeError(repr(e))
 
     logger.debug("jinja2 environmment:\n%s", pprint.pformat(cfg_as_dict))
 
     if for_pinning:
-        content = render_meta_yaml(text, for_pinning=for_pinning, **cfg_as_dict)
+        content = _render_meta_yaml(text, for_pinning=for_pinning, **cfg_as_dict)
     else:
-        content = render_meta_yaml(text, **cfg_as_dict)
+        content = _render_meta_yaml(text, **cfg_as_dict)
 
     try:
         return parse(content, cbc)
@@ -394,17 +1160,13 @@ class NullUndefined(jinja2.Undefined):
         return f'{self}["{name}"]'
 
 
-def setup_logger(logger: logging.Logger, level: Optional[str] = "INFO") -> None:
-    """Basic configuration for logging"""
-    logger.setLevel(level.upper())
-    ch = logging.StreamHandler()
-    ch.setLevel(level.upper())
-    ch.setFormatter(
-        logging.Formatter("%(asctime)-15s %(levelname)-8s %(name)s || %(message)s"),
+def setup_logging(level: str = "INFO") -> None:
+    logging.basicConfig(
+        format="%(asctime)-15s %(levelname)-8s %(name)s || %(message)s",
+        level=level.upper(),
     )
-    logger.addHandler(ch)
-    # this prevents duplicate logging messages
-    logger.propagate = False
+    logging.getLogger("urllib3").setLevel(logging.INFO)
+    logging.getLogger("github3").setLevel(logging.WARNING)
 
 
 # TODO: upstream this into networkx?
@@ -436,7 +1198,6 @@ def dump_graph_json(gx: nx.DiGraph, filename: str = "graph.json") -> None:
     links = nld["links"]
     links2 = sorted(links, key=lambda x: f'{x["source"]}{x["target"]}')
     nld["links"] = links2
-    from conda_forge_tick.lazy_json_backends import LazyJson
 
     lzj = LazyJson(filename)
     with lzj as attrs:
@@ -452,9 +1213,31 @@ def dump_graph(
     dump_graph_json(gx, filename)
 
 
-def load_graph(filename: str = "graph.json") -> nx.DiGraph:
-    from conda_forge_tick.lazy_json_backends import LazyJson
+def load_existing_graph(filename: str = DEFAULT_GRAPH_FILENAME) -> nx.DiGraph:
+    """
+    Load the graph from a file using the lazy json backend.
+    If the file does not exist, it is initialized with empty JSON before performing any reads.
+    If empty JSON is encountered, a ValueError is raised.
+    If you expect the graph to be possibly empty JSON (i.e. not initialized), use load_graph.
 
+    :return: the graph
+    :raises ValueError if the file contains empty JSON (or did not exist before)
+    """
+    gx = load_graph(filename)
+    if gx is None:
+        raise ValueError(f"Graph file {filename} contains empty JSON")
+    return gx
+
+
+def load_graph(filename: str = DEFAULT_GRAPH_FILENAME) -> Optional[nx.DiGraph]:
+    """
+    Load the graph from a file using the lazy json backend.
+    If the file does not exist, it is initialized with empty JSON.
+    If you expect the graph to be non-empty JSON, use load_existing_graph.
+
+    :return: the graph, or None if the file is empty JSON (or
+    :raises FileNotFoundError if the file does not exist
+    """
     dta = copy.deepcopy(LazyJson(filename).data)
     if dta:
         return nx.node_link_graph(dta)
@@ -493,32 +1276,20 @@ def frozen_to_json_friendly(fz, pr: Optional[LazyJson] = None):
     return d
 
 
-def github_client() -> github3.GitHub:
-    with sensitive_env() as env:
-        if env.get("GITHUB_TOKEN"):
-            return github3.login(token=env["GITHUB_TOKEN"])
-        else:
-            return github3.login(env["USERNAME"], env["PASSWORD"])
+@typing.overload
+def as_iterable(x: dict) -> Tuple[dict]: ...
 
 
 @typing.overload
-def as_iterable(x: dict) -> Tuple[dict]:
-    ...
+def as_iterable(x: str) -> Tuple[str]: ...
 
 
 @typing.overload
-def as_iterable(x: str) -> Tuple[str]:
-    ...
+def as_iterable(x: Iterable[T]) -> Iterable[T]: ...
 
 
 @typing.overload
-def as_iterable(x: Iterable[T]) -> Iterable[T]:
-    ...
-
-
-@typing.overload
-def as_iterable(x: T) -> Tuple[T]:
-    ...
+def as_iterable(x: T) -> Tuple[T]: ...
 
 
 @typing.no_type_check
@@ -561,33 +1332,109 @@ def as_iterable(iterable_or_scalar):
         return (iterable_or_scalar,)
 
 
-def _get_source_code(recipe_dir):
-    try:
-        from conda_build.api import render
-        from conda_build.config import Config
-        from conda_build.source import provide
+def sanitize_string(instr: str) -> str:
+    from conda_forge_tick.env_management import SensitiveEnv
 
-        # Use conda build to do all the downloading/extracting bits
-        md = render(
-            recipe_dir,
-            config=Config(**CB_CONFIG),
-            finalize=False,
-            bypass_env_check=True,
-        )
-        if not md:
-            return None
-        md = md[0][0]
-        # provide source dir
-        return provide(md)
-    except (SystemExit, Exception) as e:
-        raise RuntimeError("conda build src exception:" + str(e))
-
-
-def sanitize_string(instr):
     with sensitive_env() as env:
-        tokens = [env.get("PASSWORD", None)]
+        tokens = [env.get(token, None) for token in SensitiveEnv.SENSITIVE_KEYS]
+
     for token in tokens:
         if token is not None:
             instr = instr.replace(token, "~" * len(token))
 
     return instr
+
+
+def get_keys_default(dlike, keys, default, final_default):
+    defaults = [default] * (len(keys) - 1) + [final_default]
+    val = dlike
+    for k, _d in zip(keys, defaults):
+        val = val.get(k, _d) or _d
+    return val
+
+
+def get_bot_run_url():
+    return os.environ.get("RUN_URL", "")
+
+
+def get_migrator_name(migrator):
+    """Get the canonical name of a migrator."""
+    if hasattr(migrator, "name"):
+        assert isinstance(migrator.name, str)
+        migrator_name = migrator.name.lower().replace(" ", "")
+    else:
+        migrator_name = migrator.__class__.__name__.lower()
+
+    return migrator_name
+
+
+@contextlib.contextmanager
+def change_log_level(logger, new_level):
+    """Context manager to temporarily change the logging level of a logger."""
+    if isinstance(logger, str):
+        logger = logging.getLogger(logger)
+
+    if isinstance(new_level, str):
+        new_level = getattr(logging, new_level.upper())
+
+    saved_logger_level = logger.level
+    try:
+        logger.setLevel(new_level)
+        yield
+    finally:
+        logger.setLevel(saved_logger_level)
+
+
+def print_subprocess_output_strip_token(
+    completed_process: subprocess.CompletedProcess, token: str
+) -> None:
+    """
+    Use this function to print the outputs (stdout and stderr) of a subprocess.CompletedProcess object
+    that may contain sensitive information. The token will be replaced with a string
+    of asterisks of the same length.
+
+    This function assumes that you have called subprocess.run() with the arguments text=True, stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE.
+
+    If stdout or stderr is None, it will not be printed.
+
+    See run_command_hiding_token() for a convenience method that combines running a command and printing the output.
+
+    :param completed_process: The subprocess.CompletedProcess object to print the outputs of. You have probably
+        obtained this object by calling subprocess.run().
+    :param token: The token to replace with asterisks.
+
+    :raises ValueError: If the completed_process object does not contain str in stdout or stderr.
+    """
+    out, err = completed_process.stdout, completed_process.stderr
+
+    for captured, out_dev in [(out, sys.stdout), (err, sys.stderr)]:
+        if captured is None:
+            continue
+
+        if not isinstance(captured, str):
+            raise ValueError(
+                f"Expected stdout and stderr to be str, but got {type(captured)}. Run subprocess.run() with "
+                "text=True."
+            )
+
+        captured = captured.replace(token, "*" * len(token))
+        print(captured, file=out_dev, end="")
+        out_dev.flush()
+
+
+def run_command_hiding_token(args: list[str], token: str) -> int:
+    """
+    Run a command and hide the token in the output.
+
+    This is a convenience method for print_subprocess_output_strip_token() if you don't need full control
+    over subprocess.run().
+
+    :param args: The command to run.
+    :param token: The token to hide in the output.
+    :return: The return code of the command.
+    """
+    p = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    print_subprocess_output_strip_token(p, token)
+
+    return p.returncode

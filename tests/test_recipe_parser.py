@@ -1,21 +1,22 @@
 import io
+
 import pytest
 
+from conda_forge_tick.recipe_parser import CONDA_SELECTOR, CondaMetaYAML
 from conda_forge_tick.recipe_parser._parser import (
-    _parse_jinja2_variables,
-    _munge_line,
-    _unmunge_line,
+    _build_jinja2_expr_tmp,
     _demunge_jinja2_vars,
+    _munge_line,
+    _parse_jinja2_variables,
     _remunge_jinja2_vars,
     _replace_jinja2_vars,
-    _build_jinja2_expr_tmp,
+    _unmunge_line,
 )
-
-from conda_forge_tick.recipe_parser import CondaMetaYAML, CONDA_SELECTOR
 
 
 def test_parsing_ml_jinja2():
     meta_yaml = """\
+{% set namesel = 'val1' %}  # [py2k]
 {% set name = 'val1' %}  # [py2k]
 {% set name = 'val2' %}#[py3k and win]
 {% set version = '4.5.6' %}
@@ -77,6 +78,7 @@ build:
 """
 
     meta_yaml_canonical = """\
+{% set namesel = "val1" %}  # [py2k]
 {% set name = "val1" %}  # [py2k]
 {% set name = "val2" %}  # [py3k and win]
 {% set version = "4.5.6" %}
@@ -140,6 +142,7 @@ build:
     cm = CondaMetaYAML(meta_yaml)
 
     # check the jinja2 keys
+    assert cm.jinja2_vars["namesel__###conda-selector###__py2k"] == "val1"
     assert cm.jinja2_vars["name__###conda-selector###__py2k"] == "val1"
     assert cm.jinja2_vars["name__###conda-selector###__py3k and win"] == "val2"
     assert cm.jinja2_vars["version"] == "4.5.6"
@@ -212,6 +215,7 @@ build:
     true_new_meta_yaml = """\
 {% set foo = "bar" %}
 {% set xfoo = 10 %}  # [win or osx]
+{% set namesel = "val1" %}  # [py2k]
 {% set name = "val1" %}  # [py2k]
 {% set name = "val2" %}  # [py3k and win]
 {% set version = "4.5.6" %}
